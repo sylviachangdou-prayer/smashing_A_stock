@@ -1,0 +1,22 @@
+[project]
+name = "a-share-local-data"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "akshare==1.18.79",
+  "fastapi==0.116.1",
+  "pydantic==2.11.7",
+  "pypdf==5.7.0",
+  "starlette==0.47.2",
+  "uvicorn==0.35.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["."]

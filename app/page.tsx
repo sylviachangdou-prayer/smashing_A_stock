@@ -1,566 +1,900 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import Image from "next/image";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-type Company = {
+type SourceRef = {
+  source_id: string;
+  publisher: string;
+  title: string;
+  url: string;
+  period?: string | null;
+  published_at?: string | null;
+  retrieved_at: string;
+  tier: "official" | "secondary";
+};
+
+type SourceMode = "official" | "strict" | "structured";
+
+type Sourced<T = string | number> = {
+  value: T;
+  source_id: string;
+  period?: string;
+};
+
+type ApiResponse<T> = {
+  data: T;
+  sources: SourceRef[];
+  warnings: string[];
+  as_of: string;
+  status: "ok" | "partial" | "empty" | "error";
+};
+
+type SearchItem = {
   code: string;
   name: string;
   exchange: string;
-  industry: string;
-  tag: string;
-  color: string;
-  revenue: string;
-  revenueYoY: string;
-  profit: string;
-  profitYoY: string;
-  marketCap: string;
-  reportDate: string;
-  business: string;
-  shareholders: { name: string; ratio: string; change: string; kind: string }[];
-  segments: { name: string; revenue: string; share: number; yoy: string }[];
-  balance: { label: string; current: string; previous: string; change: string; note: string }[];
-  peers: { name: string; code: string; revenue: string; profit: string; margin: string; position: string }[];
-  contracts: { date: string; title: string; counterparty: string; amount: string; ratio: string; status: string }[];
+  market: string;
 };
 
-const companies: Company[] = [
-  {
-    code: "300750",
-    name: "宁德时代",
-    exchange: "深交所 · 创业板",
-    industry: "电气机械和器材制造业",
-    tag: "动力电池",
-    color: "#176b4d",
-    revenue: "3,620.1 亿元",
-    revenueYoY: "−9.7%",
-    profit: "507.5 亿元",
-    profitYoY: "+15.0%",
-    marketCap: "10,824 亿元",
-    reportDate: "2024 年报",
-    business:
-      "围绕动力电池、储能电池和电池材料构建研发、制造、销售及回收体系，收入结构以动力电池系统为主，储能业务是第二增长曲线。",
-    shareholders: [
-      { name: "厦门瑞庭投资有限公司", ratio: "23.29%", change: "0.00%", kind: "控股股东" },
-      { name: "黄世霖", ratio: "10.59%", change: "0.00%", kind: "境内自然人" },
-      { name: "香港中央结算有限公司", ratio: "9.14%", change: "+0.31%", kind: "境外名义持有人" },
-      { name: "李平", ratio: "4.58%", change: "0.00%", kind: "境内自然人" },
-      { name: "本田技研工业（中国）", ratio: "0.89%", change: "0.00%", kind: "产业股东" },
-    ],
-    segments: [
-      { name: "动力电池系统", revenue: "2,535.7 亿元", share: 70, yoy: "−11.3%" },
-      { name: "储能电池系统", revenue: "572.9 亿元", share: 16, yoy: "+12.7%" },
-      { name: "电池材料及回收", revenue: "286.4 亿元", share: 8, yoy: "−18.1%" },
-      { name: "电池矿产资源及其他", revenue: "225.1 亿元", share: 6, yoy: "+3.6%" },
-    ],
-    balance: [
-      { label: "合同负债", current: "312.8 亿元", previous: "273.5 亿元", change: "+14.4%", note: "预收货款及履约安排增加" },
-      { label: "应收账款", current: "693.2 亿元", previous: "658.4 亿元", change: "+5.3%", note: "关注增速与收入增速背离" },
-      { label: "应收账款周转天数", current: "68.9 天", previous: "61.4 天", change: "+7.5 天", note: "回款周期有所拉长" },
-    ],
-    peers: [
-      { name: "比亚迪", code: "002594", revenue: "7,771 亿元", profit: "402 亿元", margin: "5.2%", position: "整车 + 电池一体化" },
-      { name: "亿纬锂能", code: "300014", revenue: "486 亿元", profit: "41 亿元", margin: "8.5%", position: "动力与储能电池" },
-      { name: "国轩高科", code: "002074", revenue: "354 亿元", profit: "12 亿元", margin: "3.4%", position: "磷酸铁锂电池" },
-    ],
-    contracts: [
-      { date: "2024-12-10", title: "战略合作与电池供应安排", counterparty: "整车客户 A", amount: "未披露", ratio: "—", status: "框架协议" },
-      { date: "2024-09-18", title: "储能系统长期供货协议", counterparty: "海外能源客户 B", amount: "按订单结算", ratio: "—", status: "履行中" },
-      { date: "2024-04-26", title: "合资项目及技术许可安排", counterparty: "产业合作方 C", amount: "以公告为准", ratio: "—", status: "已公告" },
-    ],
-  },
-  {
-    code: "600519",
-    name: "贵州茅台",
-    exchange: "上交所 · 主板",
-    industry: "酒、饮料和精制茶制造业",
-    tag: "白酒",
-    color: "#8b2f36",
-    revenue: "1,741.4 亿元",
-    revenueYoY: "+15.7%",
-    profit: "862.3 亿元",
-    profitYoY: "+15.4%",
-    marketCap: "18,965 亿元",
-    reportDate: "2024 年报",
-    business:
-      "核心业务为茅台酒及系列酒的生产与销售，采取经销与直销并行的渠道体系。品牌、稀缺产能和渠道掌控构成主要竞争壁垒。",
-    shareholders: [
-      { name: "中国贵州茅台酒厂（集团）", ratio: "54.07%", change: "0.00%", kind: "控股股东" },
-      { name: "香港中央结算有限公司", ratio: "5.96%", change: "−0.18%", kind: "境外名义持有人" },
-      { name: "贵州省国有资本运营", ratio: "4.54%", change: "0.00%", kind: "国有法人" },
-      { name: "中央汇金资产管理", ratio: "0.86%", change: "0.00%", kind: "国有法人" },
-      { name: "中国证券金融股份", ratio: "0.64%", change: "0.00%", kind: "国有法人" },
-    ],
-    segments: [
-      { name: "茅台酒", revenue: "1,458.7 亿元", share: 84, yoy: "+15.3%" },
-      { name: "系列酒", revenue: "246.8 亿元", share: 14, yoy: "+18.1%" },
-      { name: "其他业务", revenue: "35.9 亿元", share: 2, yoy: "+9.2%" },
-    ],
-    balance: [
-      { label: "合同负债", current: "95.9 亿元", previous: "141.3 亿元", change: "−32.1%", note: "经销商预付款节奏变化" },
-      { label: "应收账款", current: "0.6 亿元", previous: "0.4 亿元", change: "+50.0%", note: "规模低，绝对值更重要" },
-      { label: "应收账款周转天数", current: "0.1 天", previous: "0.1 天", change: "0.0 天", note: "现款现货特征明显" },
-    ],
-    peers: [
-      { name: "五粮液", code: "000858", revenue: "891 亿元", profit: "318 亿元", margin: "35.7%", position: "高端浓香白酒" },
-      { name: "泸州老窖", code: "000568", revenue: "311 亿元", profit: "135 亿元", margin: "43.4%", position: "高端浓香白酒" },
-      { name: "山西汾酒", code: "600809", revenue: "361 亿元", profit: "122 亿元", margin: "33.8%", position: "清香型白酒" },
-    ],
-    contracts: [
-      { date: "2024-11-08", title: "日常关联交易额度安排", counterparty: "茅台集团及关联方", amount: "年度预计额度", ratio: "以公告为准", status: "履行中" },
-      { date: "2024-05-29", title: "包装材料采购框架", counterparty: "供应商联合体", amount: "未单列", ratio: "—", status: "框架协议" },
-      { date: "2024-02-04", title: "物流运输服务协议", counterparty: "物流服务商", amount: "按实际结算", ratio: "—", status: "履行中" },
-    ],
-  },
-  {
-    code: "601668",
-    name: "中国建筑",
-    exchange: "上交所 · 主板",
-    industry: "土木工程建筑业",
-    tag: "建筑工程",
-    color: "#1f5f8b",
-    revenue: "21,914 亿元",
-    revenueYoY: "−3.4%",
-    profit: "461 亿元",
-    profitYoY: "−15.2%",
-    marketCap: "2,423 亿元",
-    reportDate: "2024 年报",
-    business:
-      "业务覆盖房屋建筑、基础设施建设、房地产开发与勘察设计，订单规模大、项目周期长，应收款项与合同负债是判断现金流质量的关键。",
-    shareholders: [
-      { name: "中国建筑集团有限公司", ratio: "56.35%", change: "0.00%", kind: "控股股东" },
-      { name: "香港中央结算有限公司", ratio: "3.12%", change: "+0.09%", kind: "境外名义持有人" },
-      { name: "中央汇金资产管理", ratio: "1.45%", change: "0.00%", kind: "国有法人" },
-      { name: "全国社保基金一一三组合", ratio: "0.54%", change: "+0.04%", kind: "社保基金" },
-      { name: "中国证券金融股份", ratio: "0.45%", change: "0.00%", kind: "国有法人" },
-    ],
-    segments: [
-      { name: "房屋建筑工程", revenue: "13,210 亿元", share: 60, yoy: "−4.5%" },
-      { name: "基础设施建设", revenue: "5,620 亿元", share: 26, yoy: "+2.1%" },
-      { name: "房地产开发", revenue: "2,580 亿元", share: 12, yoy: "−10.2%" },
-      { name: "勘察设计及其他", revenue: "504 亿元", share: 2, yoy: "+1.7%" },
-    ],
-    balance: [
-      { label: "合同负债", current: "2,836 亿元", previous: "2,612 亿元", change: "+8.6%", note: "预收工程款与售房款增加" },
-      { label: "应收账款", current: "2,948 亿元", previous: "2,603 亿元", change: "+13.3%", note: "高于收入增速，需跟踪回款" },
-      { label: "应收账款周转天数", current: "46.2 天", previous: "40.7 天", change: "+5.5 天", note: "工程结算周期拉长" },
-    ],
-    peers: [
-      { name: "中国中铁", code: "601390", revenue: "11,576 亿元", profit: "276 亿元", margin: "2.4%", position: "铁路与基建工程" },
-      { name: "中国铁建", code: "601186", revenue: "10,754 亿元", profit: "246 亿元", margin: "2.3%", position: "综合基建工程" },
-      { name: "中国交建", code: "601800", revenue: "7,716 亿元", profit: "239 亿元", margin: "3.1%", position: "交通基础设施" },
-    ],
-    contracts: [
-      { date: "2024-12-20", title: "重大项目公告（12 月）", counterparty: "地方政府及项目公司", amount: "1,233 亿元", ratio: "5.6%", status: "新签" },
-      { date: "2024-10-23", title: "重大项目公告（10 月）", counterparty: "业主单位合计", amount: "782 亿元", ratio: "3.6%", status: "新签" },
-      { date: "2024-07-26", title: "重大项目公告（7 月）", counterparty: "业主单位合计", amount: "669 亿元", ratio: "3.1%", status: "新签" },
-    ],
-  },
-];
+type MarketBriefData = {
+  headlines: Array<{
+    title: string;
+    summary?: string;
+    published_at?: string;
+    url: string;
+    source_id: string;
+  }>;
+};
 
-const tradingDates = [
-  "06-03", "06-04", "06-05", "06-06", "06-09", "06-10", "06-11", "06-12", "06-13", "06-16",
-  "06-17", "06-18", "06-19", "06-20", "06-23", "06-24", "06-25", "06-26", "06-27", "06-30",
-];
+type Metric = {
+  value: number;
+  previous_value?: number;
+  yoy_percent?: number;
+  source_id: string;
+  period?: string;
+};
 
-const flows = [2.8, -1.2, 3.9, 0.7, -2.6, 4.3, 1.8, -0.9, 2.2, 5.1, -3.4, -1.1, 1.4, 3.2, -2.0, 4.8, 0.6, -0.7, 2.7, 1.9];
+type OverviewData = {
+  identity: {
+    code?: Sourced;
+    name?: Sourced;
+    exchange?: Sourced;
+    market?: Sourced;
+  };
+  profile: Record<string, Sourced | undefined>;
+  financial: {
+    period?: string;
+    metrics?: Record<string, Metric>;
+    annual_metrics?: Array<{
+      period: string;
+      revenue?: number;
+      net_profit?: number;
+      source_id: string;
+    }>;
+  };
+  shareholders: Array<{
+    period: string;
+    name?: string;
+    shares?: number;
+    ratio_percent?: number;
+    change?: string | number;
+    holder_type?: string;
+    source_id: string;
+  }>;
+  business_segments: Array<{
+    category_type?: string;
+    name: string;
+    revenue: number;
+    revenue_share_percent?: number;
+    gross_margin_percent?: number;
+    period?: string;
+    source_id: string;
+  }>;
+};
 
-const tabs = [
-  ["overview", "公司总览"],
-  ["capital", "近一月资金面"],
-  ["business", "业务与财务"],
-  ["peers", "同业竞争"],
-  ["contracts", "重大合同"],
-  ["sources", "来源与口径"],
-] as const;
+type CapitalData = {
+  daily_margin: Array<{
+    date: string;
+    financing_buy?: number;
+    financing_repay?: number;
+    financing_balance?: number;
+    financing_balance_change?: number | null;
+    securities_lending_sell?: number;
+    securities_lending_repay?: number;
+    securities_lending_balance?: number;
+    margin_total?: number;
+    source_id: string;
+  }>;
+  institution_signals: Array<Record<string, unknown>>;
+};
+
+type ContractRow = {
+  title: string;
+  published_at?: string;
+  url: string;
+  counterparty?: string;
+  amount_text?: string;
+  source_id: string;
+};
+
+type PeersData = {
+  label?: string;
+  industry?: Sourced;
+  board_name?: Sourced;
+  companies?: Array<{
+    code: string;
+    name?: string;
+    latest_price?: number;
+    market_cap?: number;
+    source_id: string;
+  }>;
+};
+
+type ReportState = {
+  company: SearchItem;
+  sourceMode: SourceMode;
+  overview?: ApiResponse<OverviewData>;
+  capital?: ApiResponse<CapitalData>;
+  contracts?: ApiResponse<ContractRow[]>;
+  peers?: ApiResponse<PeersData>;
+  loading: boolean;
+};
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8010";
+const HISTORY_LIMITS = [5, 10, 20, 50];
+const HISTORY_STORAGE_KEY = "stock-tool-search-history";
+const HISTORY_LIMIT_STORAGE_KEY = "stock-tool-search-history-limit";
+const SOURCE_MODES: Record<SourceMode, { label: string; description: string }> = {
+  official: {
+    label: "官方披露优先",
+    description: "官方原文为核验锚点，二手接口仅用于结构化字段。",
+  },
+  strict: {
+    label: "仅官方来源",
+    description: "排除二手结构化数值；没有官方可用字段时保持缺失。",
+  },
+  structured: {
+    label: "结构化数据优先",
+    description: "减少官方回链和 PDF 抽取，以明确标注的结构化接口优先。",
+  },
+};
+
+async function getJson<T>(path: string): Promise<ApiResponse<T>> {
+  const response = await fetch(`${API_BASE}${path}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+async function searchCompanies(keyword: string, signal?: AbortSignal) {
+  const response = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(keyword)}`, { signal });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const payload: ApiResponse<SearchItem[]> = await response.json();
+  return payload.data ?? [];
+}
+
+function sourceMap(report?: ReportState) {
+  const sources = [
+    ...(report?.overview?.sources ?? []),
+    ...(report?.capital?.sources ?? []),
+    ...(report?.contracts?.sources ?? []),
+    ...(report?.peers?.sources ?? []),
+  ];
+  return new Map(sources.map((item) => [item.source_id, item]));
+}
+
+function formatMoney(value?: number | null) {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  const number = Number(value);
+  const absolute = Math.abs(number);
+  if (absolute >= 1e8) return `${(number / 1e8).toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 亿元`;
+  if (absolute >= 1e4) return `${(number / 1e4).toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 万元`;
+  return `${number.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 元`;
+}
+
+function formatNumber(value?: number | null) {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function formatPercent(value?: number | null) {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  return `${Number(value) > 0 ? "+" : ""}${Number(value).toFixed(2)}%`;
+}
+
+function SourceLink({
+  sourceId,
+  sources,
+  compact = false,
+}: {
+  sourceId?: string;
+  sources: Map<string, SourceRef>;
+  compact?: boolean;
+}) {
+  const item = sourceId ? sources.get(sourceId) : undefined;
+  if (!item) return null;
+  return (
+    <a
+      className={compact ? "source-link compact" : "source-link"}
+      href={item.url}
+      target="_blank"
+      rel="noreferrer"
+      title={item.title}
+    >
+      {item.publisher} ↗
+    </a>
+  );
+}
+
+function StatusBadge({ response }: { response?: ApiResponse<unknown> }) {
+  if (!response) return <span className="status-badge loading">读取中</span>;
+  return <span className={`status-badge ${response.status}`}>{response.status}</span>;
+}
 
 export default function Home() {
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState(["300750"]);
-  const [activeCode, setActiveCode] = useState("300750");
-  const [activeTab, setActiveTab] = useState<(typeof tabs)[number][0]>("overview");
+  const [suggestions, setSuggestions] = useState<SearchItem[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [reports, setReports] = useState<Record<string, ReportState>>({});
+  const [selected, setSelected] = useState<string[]>([]);
+  const [activeCode, setActiveCode] = useState("");
   const [notice, setNotice] = useState("");
+  const [sourceMode, setSourceMode] = useState<SourceMode>("official");
+  const [history, setHistory] = useState<SearchItem[]>([]);
+  const [historyLimit, setHistoryLimit] = useState(10);
+  const [historyReady, setHistoryReady] = useState(false);
+  const [marketBrief, setMarketBrief] = useState<ApiResponse<MarketBriefData> | null>(null);
+  const requestIds = useRef<Record<string, number>>({});
 
-  const active = companies.find((company) => company.code === activeCode) ?? companies[0];
-  const selectedCompanies = companies.filter((company) => selected.includes(company.code));
-  const suggestions = useMemo(() => {
-    const keyword = query.trim().toLowerCase();
-    if (!keyword) return companies;
-    return companies.filter((company) =>
-      `${company.name}${company.code}${company.tag}`.toLowerCase().includes(keyword),
-    );
+  const active = activeCode ? reports[activeCode] : undefined;
+  const sources = useMemo(() => sourceMap(active), [active]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const storedLimit = Number(window.localStorage.getItem(HISTORY_LIMIT_STORAGE_KEY));
+        const nextLimit = HISTORY_LIMITS.includes(storedLimit) ? storedLimit : 10;
+        const storedHistory = JSON.parse(window.localStorage.getItem(HISTORY_STORAGE_KEY) ?? "[]");
+        const validHistory = Array.isArray(storedHistory)
+          ? storedHistory.filter((item) => item?.code && item?.name).slice(0, nextLimit)
+          : [];
+        setHistoryLimit(nextLimit);
+        setHistory(validHistory);
+      } catch {
+        setHistory([]);
+      } finally {
+        setHistoryReady(true);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!historyReady) return;
+    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history.slice(0, historyLimit)));
+    window.localStorage.setItem(HISTORY_LIMIT_STORAGE_KEY, String(historyLimit));
+  }, [history, historyLimit, historyReady]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(`${API_BASE}/api/market-brief`, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<ApiResponse<MarketBriefData>>;
+      })
+      .then(setMarketBrief)
+      .catch((error) => {
+        if ((error as Error).name !== "AbortError") setMarketBrief(null);
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const keyword = query.trim();
+    if (!keyword) {
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setSearching(true);
+      try {
+        setSuggestions(await searchCompanies(keyword, controller.signal));
+      } catch (error) {
+        if ((error as Error).name !== "AbortError") setNotice("无法连接本地数据服务。请运行 npm run local。");
+      } finally {
+        setSearching(false);
+      }
+    }, 250);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
   }, [query]);
 
-  function addCompany(company: Company) {
-    setSelected((current) => current.includes(company.code) ? current : [...current, company.code]);
+  async function loadCompany(company: SearchItem, refresh = false, mode = sourceMode) {
+    if (!refresh && reports[company.code]?.sourceMode === mode) {
+      setActiveCode(company.code);
+      return;
+    }
+    if (!reports[company.code] && selected.length >= 5) {
+      setNotice("最多同时保留 5 家公司。");
+      return;
+    }
+    setSelected((current) => (current.includes(company.code) ? current : [...current, company.code]));
     setActiveCode(company.code);
     setQuery("");
-    setNotice(`${company.name}已加入研究列表`);
+    setSuggestions([]);
+    setReports((current) => ({
+      ...current,
+      [company.code]: { company, sourceMode: mode, loading: true },
+    }));
+    const requestId = (requestIds.current[company.code] ?? 0) + 1;
+    requestIds.current[company.code] = requestId;
+    const modeParam = `mode=${mode}`;
+    const suffix = `?${modeParam}${refresh ? "&refresh=true" : ""}`;
+    const [overview, capital, contracts, peers] = await Promise.allSettled([
+      getJson<OverviewData>(`/api/company/${company.code}/overview${suffix}`),
+      getJson<CapitalData>(`/api/company/${company.code}/capital?days=20&${modeParam}${refresh ? "&refresh=true" : ""}`),
+      getJson<ContractRow[]>(`/api/company/${company.code}/contracts?months=24&${modeParam}${refresh ? "&refresh=true" : ""}`),
+      getJson<PeersData>(`/api/company/${company.code}/peers${suffix}`),
+    ]);
+    if (requestIds.current[company.code] !== requestId) return;
+    const failed = <T,>(result: PromiseSettledResult<ApiResponse<T>>, label: string): ApiResponse<T> =>
+      result.status === "fulfilled"
+        ? result.value
+        : {
+            data: {} as T,
+            sources: [],
+            warnings: [`${label}请求失败：${result.reason instanceof Error ? result.reason.message : "未知错误"}`],
+            as_of: new Date().toISOString(),
+            status: "error",
+          };
+    setReports((current) => ({
+      ...current,
+      [company.code]: {
+        company,
+        sourceMode: mode,
+        overview: failed(overview, "公司总览"),
+        capital: failed(capital, "资金面"),
+        contracts: failed(contracts, "合同公告"),
+        peers: failed(peers, "同业"),
+        loading: false,
+      },
+    }));
+  }
+
+  function changeSourceMode(mode: SourceMode) {
+    setSourceMode(mode);
+    if (active) void loadCompany(active.company, true, mode);
+  }
+
+  function rememberCompany(company: SearchItem) {
+    setHistory((current) => [
+      company,
+      ...current.filter((item) => item.code !== company.code),
+    ].slice(0, historyLimit));
+  }
+
+  function changeHistoryLimit(limit: number) {
+    setHistoryLimit(limit);
+    setHistory((current) => current.slice(0, limit));
+  }
+
+  async function submitSearch(event: FormEvent) {
+    event.preventDefault();
+    const keyword = query.trim();
+    if (!keyword) return;
+    setSearching(true);
+    setNotice("");
+    try {
+      const matches = await searchCompanies(keyword);
+      setSuggestions(matches);
+      const normalized = keyword.toLowerCase();
+      const match = matches.find(
+        (company) => company.code.toLowerCase() === normalized || company.name.toLowerCase() === normalized,
+      ) ?? matches[0];
+      if (match) {
+        rememberCompany(match);
+        await loadCompany(match);
+      } else {
+        setNotice("未找到匹配的当前上市 A 股。");
+      }
+    } catch {
+      setNotice("无法连接本地数据服务。请运行 npm run local。");
+    } finally {
+      setSearching(false);
+    }
   }
 
   function removeCompany(code: string) {
-    if (selected.length === 1) {
-      setNotice("研究列表至少保留一家公司");
-      return;
-    }
     const next = selected.filter((item) => item !== code);
     setSelected(next);
-    if (activeCode === code) setActiveCode(next[0]);
+    if (activeCode === code) setActiveCode(next[0] ?? "");
   }
 
-  function runSearch() {
-    const keyword = query.trim().toLowerCase();
-    const matched = companies.find((company) =>
-      company.code === keyword || company.name.toLowerCase().includes(keyword),
+  const comparison = useMemo(() => {
+    const loaded = selected
+      .map((code) => reports[code])
+      .filter((item) => item?.sourceMode === sourceMode && item?.overview?.data.financial);
+    if (loaded.length < 2) return null;
+    const periodSets = loaded.map(
+      (item) => new Set((item.overview?.data.financial.annual_metrics ?? []).map((row) => row.period)),
     );
-    if (matched) addCompany(matched);
-    else setNotice("当前原型仅内置 3 家演示公司；正式版将接入沪深北全市场代码表。");
-  }
+    const common = [...periodSets[0]].filter((period) => periodSets.every((set) => set.has(period))).sort().reverse()[0];
+    if (!common) return null;
+    return {
+      period: common,
+      rows: loaded.map((item) => ({
+        company: item.company,
+        metric: item.overview?.data.financial.annual_metrics?.find((row) => row.period === common),
+        sources: sourceMap(item),
+      })),
+    };
+  }, [reports, selected, sourceMode]);
 
-  function jump(tab: (typeof tabs)[number][0]) {
-    setActiveTab(tab);
-    document.getElementById(tab)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
+  const metrics = active?.overview?.data.financial.metrics ?? {};
+  const profile = active?.overview?.data.profile ?? {};
+  const shareholders = active?.overview?.data.shareholders ?? [];
+  const latestShareholderPeriod = shareholders[0]?.period;
+  const latestShareholders = shareholders.filter((item) => item.period === latestShareholderPeriod);
+  const segments = active?.overview?.data.business_segments ?? [];
+  const margin = active?.capital?.data.daily_margin ?? [];
+  const contractRows = active?.contracts?.data ?? [];
+  const peerRows = active?.peers?.data.companies ?? [];
+  const allWarnings = [
+    ...(active?.overview?.warnings ?? []).map((text) => `总览：${text}`),
+    ...(active?.capital?.warnings ?? []).map((text) => `资金：${text}`),
+    ...(active?.contracts?.warnings ?? []).map((text) => `合同：${text}`),
+    ...(active?.peers?.warnings ?? []).map((text) => `同业：${text}`),
+  ];
 
   return (
     <main>
-      <div className="prototype-banner">
-        <span>产品原型</span>
-        页面中的公司数值为界面演示数据，不构成投资建议；正式版只展示可回溯到公告或交易所的记录。
-      </div>
-
       <header className="topbar">
-        <a className="brand" href="#top" aria-label="A股公司研究台首页">
-          <span className="brand-mark">析</span>
-          <span><b>A股公司研究台</b><small>Official-source company intelligence</small></span>
+        <a className="brand" href="#top">
+          <span className="brand-mark"><Image src="/niu-oracle.svg" alt="甲骨文牛字" width={28} height={28} /></span>
+          <span><b>A股公司研究台</b><small>LOCAL DISCLOSURE RESEARCH</small></span>
         </a>
-        <nav aria-label="页面导航">
-          <a href="#research">公司研究</a>
-          <a href="#compare">批量比较</a>
-          <a href="#sources">数据说明</a>
+        <nav>
+          <a href="#overview">公司总览</a>
+          <a href="#capital">两融</a>
+          <a href="#sources">来源</a>
         </nav>
-        <div className="freshness"><i /> 官方源优先 · T+1 / 报告期更新</div>
+        <label className="source-mode">
+          <i />
+          <span>来源模式</span>
+          <select
+            value={sourceMode}
+            onChange={(event) => changeSourceMode(event.target.value as SourceMode)}
+            aria-label="来源模式"
+          >
+            {Object.entries(SOURCE_MODES).map(([value, option]) => (
+              <option key={value} value={value}>{option.label}</option>
+            ))}
+          </select>
+        </label>
       </header>
 
       <section className="hero" id="top">
         <div>
           <p className="eyebrow">A-SHARE DISCLOSURE INTELLIGENCE</p>
-          <h1>查公司，不只看一个数字。<br />把资金、业务和合同放回证据链。</h1>
+          <h1>今天准能行。</h1>
           <p className="hero-copy">
-            输入上市公司名称或股票代码；单家公司纵向研究，多家公司横向比较。每项结论标注报告期、数据口径与原始出处。
+            输入沪深北 A 股公司名称或六位代码。财务、股东、两融、合同公告与同业模块独立读取，单一上游失败不会阻塞整份报告。
           </p>
         </div>
         <div className="hero-stat">
-          <span>目标覆盖</span>
+          <span>当前范围</span>
           <strong>沪 · 深 · 北</strong>
-          <p>财务报告 / 交易所数据 / 临时公告 / 公司官网</p>
+          <p>公司概况、财务、股东、主营、两融、合同公告与同业比较；最多保留 5 家公司。</p>
+          <small>{SOURCE_MODES[sourceMode].label}：{SOURCE_MODES[sourceMode].description}</small>
         </div>
       </section>
 
-      <section className="search-panel" aria-label="公司搜索">
-        <div className="search-row">
+      <section className="search-panel">
+        <form className="search-row" onSubmit={submitSearch}>
           <label>
             <span className="search-icon">⌕</span>
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && runSearch()}
-              placeholder="输入公司名称或代码，如：宁德时代 / 300750"
-              aria-label="输入公司名称或股票代码"
+              placeholder="公司名称或代码，如：贵州茅台 / 600519"
+              aria-label="公司名称或股票代码"
             />
           </label>
-          <button onClick={runSearch}>开始研究</button>
-        </div>
-        {query && (
+          <button type="submit">{searching ? "查询中…" : "开始研究"}</button>
+        </form>
+        {query && suggestions.length > 0 && (
           <div className="suggestions">
-            {suggestions.length ? suggestions.map((company) => (
-              <button key={company.code} onClick={() => addCompany(company)}>
-                <span className="company-dot" style={{ background: company.color }} />
-                <b>{company.name}</b><small>{company.code} · {company.exchange}</small>
+            {suggestions.map((company) => (
+              <button key={company.code} onClick={() => { rememberCompany(company); void loadCompany(company); }}>
+                <span className="company-dot" />
+                <b>{company.name}</b>
+                <small>{company.code} · {company.market}</small>
               </button>
-            )) : <p>未找到演示公司</p>}
+            ))}
           </div>
         )}
-        <div className="selected-row">
-          <span>研究列表</span>
-          {selectedCompanies.map((company) => (
-            <button
-              key={company.code}
-              className={company.code === activeCode ? "company-chip active" : "company-chip"}
-              onClick={() => setActiveCode(company.code)}
-            >
-              {company.name} <small>{company.code}</small>
-              <i onClick={(event) => { event.stopPropagation(); removeCompany(company.code); }}>×</i>
-            </button>
-          ))}
-          <span className="quick-add">快速添加：</span>
-          {companies.filter((company) => !selected.includes(company.code)).map((company) => (
-            <button className="text-add" key={company.code} onClick={() => addCompany(company)}>+ {company.name}</button>
-          ))}
+        <div className="search-lists">
+          <div className="memory-group">
+            <div className="memory-heading"><span>研究列表</span><small>最多 5 家</small></div>
+            <div className="memory-chips">
+              {selected.length === 0 && <small>暂无</small>}
+              {selected.map((code) => {
+                const report = reports[code];
+                return (
+                  <button
+                    key={code}
+                    className={`company-chip ${code === activeCode ? "active" : ""}`}
+                    onClick={() => report && loadCompany(report.company)}
+                  >
+                    {report?.company.name ?? code} <small>{code}</small>
+                    <i onClick={(event) => { event.stopPropagation(); removeCompany(code); }}>×</i>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="memory-group">
+            <div className="memory-heading">
+              <span>历史搜索</span>
+              <label>
+                保留
+                <select
+                  value={historyLimit}
+                  onChange={(event) => changeHistoryLimit(Number(event.target.value))}
+                  aria-label="历史搜索保留条数"
+                >
+                  {HISTORY_LIMITS.map((limit) => <option key={limit} value={limit}>{limit} 条</option>)}
+                </select>
+              </label>
+            </div>
+            <div className="memory-chips">
+              {history.length === 0 && <small>暂无</small>}
+              {history.map((company) => (
+                <button key={company.code} className="history-chip" onClick={() => loadCompany(company)}>
+                  {company.name} <small>{company.code}</small>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
         {notice && <button className="notice" onClick={() => setNotice("")}>{notice}<span>×</span></button>}
       </section>
 
-      {selectedCompanies.length > 1 && (
-        <section className="compare-strip" id="compare">
-          <div className="section-heading compact">
-            <div><span>COMPARE</span><h2>横向快照</h2></div>
-            <p>统一采用最近完整年度口径；点击公司进入完整研究页。</p>
+      {(!active || (active.loading && !active.overview)) && (marketBrief?.data.headlines.length ?? 0) > 0 && (
+        <section className="market-brief">
+          <div className="section-heading">
+            <div><span>LIVE MARKET BRIEF</span><h2>今日全球财经头条</h2></div>
+            <p>由公开财经信息流整理；点击标题查看原文，新闻不参与公司研究结论。</p>
           </div>
-          <div className="compare-grid">
-            {selectedCompanies.map((company) => (
-              <button key={company.code} onClick={() => setActiveCode(company.code)}>
-                <div><span className="company-dot" style={{ background: company.color }} /><b>{company.name}</b><small>{company.code}</small></div>
-                <dl>
-                  <div><dt>营业收入</dt><dd>{company.revenue}</dd></div>
-                  <div><dt>归母净利润</dt><dd>{company.profit}</dd></div>
-                  <div><dt>净利增速</dt><dd className={company.profitYoY.startsWith("+") ? "positive" : "negative"}>{company.profitYoY}</dd></div>
-                </dl>
-              </button>
+          <div className="headline-grid">
+            {marketBrief!.data.headlines.map((headline) => (
+              <a key={headline.source_id} href={headline.url} target="_blank" rel="noreferrer">
+                <small>{headline.published_at?.slice(5, 16) ?? "最新"} · 东方财富</small>
+                <h3>{headline.title}</h3>
+                {headline.summary && <p>{headline.summary}</p>}
+              </a>
             ))}
           </div>
         </section>
       )}
 
-      <section className="research-shell" id="research">
-        <aside>
-          <div className="aside-company">
-            <span className="company-monogram" style={{ background: active.color }}>{active.name.slice(0, 1)}</span>
-            <div><b>{active.name}</b><small>{active.code} · {active.exchange}</small></div>
+      {comparison && (
+        <section className="compare-section">
+          <div className="section-heading">
+            <div><span>COMMON ANNUAL PERIOD</span><h2>共同完整年度比较</h2></div>
+            <p>仅比较所有已选公司均有数据的最近完整年度：{comparison.period}</p>
           </div>
-          <div className="report-tag"><span>当前口径</span><b>{active.reportDate}</b></div>
-          <nav aria-label="研究模块">
-            {tabs.map(([id, label], index) => (
-              <button key={id} className={activeTab === id ? "active" : ""} onClick={() => jump(id)}>
-                <span>0{index + 1}</span>{label}
-              </button>
-            ))}
-          </nav>
-          <div className="source-health">
-            <span>来源完整度</span><strong>6 / 8</strong>
-            <div><i /><i /><i /><i /><i /><i /><i className="muted" /><i className="muted" /></div>
-            <small>机构日频、合同金额可能受披露限制</small>
+          <div className="table-wrap panel">
+            <table>
+              <thead><tr><th>公司</th><th>营业收入</th><th>归母净利润</th><th>来源</th></tr></thead>
+              <tbody>
+                {comparison.rows.map(({ company, metric, sources: rowSources }) => (
+                  <tr key={company.code}>
+                    <td><b>{company.name}</b><small>{company.code}</small></td>
+                    <td>{formatMoney(metric?.revenue)}</td>
+                    <td>{formatMoney(metric?.net_profit)}</td>
+                    <td><SourceLink sourceId={metric?.source_id} sources={rowSources} compact /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        </aside>
+        </section>
+      )}
 
-        <div className="report">
-          <section id="overview" className="report-section">
-            <div className="company-title">
-              <div>
-                <p>{active.industry} · {active.tag}</p>
-                <h2>{active.name} <span>{active.code}</span></h2>
-                <small>演示数据更新至 {active.reportDate} · 正式版将显示公告发布日期与抓取时间</small>
+      {active && (
+        <section className="report-shell">
+          <div className="report-head">
+            <div className="company-monogram">{active.company.name.slice(0, 1)}</div>
+            <div>
+              <p>{active.company.market} · {active.company.exchange}</p>
+              <h2>{active.company.name} <span>{active.company.code}</span></h2>
+              <small>报告抓取时间：{active.overview?.as_of ? new Date(active.overview.as_of).toLocaleString("zh-CN") : "读取中"}</small>
+            </div>
+            <button
+              className="refresh"
+              disabled={active.loading}
+              onClick={() => loadCompany(active.company, true)}
+            >
+              {active.loading ? "读取中…" : "绕过缓存刷新"}
+            </button>
+          </div>
+
+          {active.loading && !active.overview && (
+            <div className="loading-panel">
+              <p>正在从公开数据源读取四个独立模块…</p>
+              <small>预计仍需约 {sourceMode === "official" ? "1–2" : "1"} 分钟；上游接口拥塞时可能延长。</small>
+            </div>
+          )}
+
+          {active.overview && (
+            <section className="report-section" id="overview">
+              <div className="section-heading">
+                <div><span>OVERVIEW</span><h2>公司概况与核心财务</h2></div>
+                <p>收入与归母净利润采用最新报告期及上年同期；金额单位由原始报表统一为人民币元。</p>
               </div>
-              <a href={active.code.startsWith("3") || active.code.startsWith("0") ? "https://www.szse.cn/" : "https://www.sse.com.cn/"} target="_blank" rel="noreferrer">交易所主页 ↗</a>
-            </div>
+              <div className="metric-grid">
+                {metrics.revenue && (
+                  <article>
+                    <span>营业收入 · {metrics.revenue.period}</span>
+                    <strong>{formatMoney(metrics.revenue.value)}</strong>
+                    <small className={(metrics.revenue.yoy_percent ?? 0) >= 0 ? "positive" : "negative"}>
+                      同比 {formatPercent(metrics.revenue.yoy_percent)}
+                    </small>
+                    <SourceLink sourceId={metrics.revenue.source_id} sources={sources} compact />
+                  </article>
+                )}
+                {metrics.net_profit && (
+                  <article>
+                    <span>归母净利润 · {metrics.net_profit.period}</span>
+                    <strong>{formatMoney(metrics.net_profit.value)}</strong>
+                    <small className={(metrics.net_profit.yoy_percent ?? 0) >= 0 ? "positive" : "negative"}>
+                      同比 {formatPercent(metrics.net_profit.yoy_percent)}
+                    </small>
+                    <SourceLink sourceId={metrics.net_profit.source_id} sources={sources} compact />
+                  </article>
+                )}
+                {metrics.contract_liabilities && (
+                  <article>
+                    <span>合同负债 · {metrics.contract_liabilities.period}</span>
+                    <strong>{formatMoney(metrics.contract_liabilities.value)}</strong>
+                    <small>上年同期 {formatMoney(metrics.contract_liabilities.previous_value)}</small>
+                    <SourceLink sourceId={metrics.contract_liabilities.source_id} sources={sources} compact />
+                  </article>
+                )}
+                {metrics.accounts_receivable && (
+                  <article>
+                    <span>应收账款 · {metrics.accounts_receivable.period}</span>
+                    <strong>{formatMoney(metrics.accounts_receivable.value)}</strong>
+                    <small>上年同期 {formatMoney(metrics.accounts_receivable.previous_value)}</small>
+                    <SourceLink sourceId={metrics.accounts_receivable.source_id} sources={sources} compact />
+                  </article>
+                )}
+              </div>
 
-            <div className="metric-grid">
-              <article><span>营业收入</span><strong>{active.revenue}</strong><small className={active.revenueYoY.startsWith("+") ? "positive" : "negative"}>{active.revenueYoY} 同比</small></article>
-              <article><span>归母净利润</span><strong>{active.profit}</strong><small className={active.profitYoY.startsWith("+") ? "positive" : "negative"}>{active.profitYoY} 同比</small></article>
-              <article><span>演示市值</span><strong>{active.marketCap}</strong><small>仅用于界面占位</small></article>
-              <article><span>信息质量</span><strong>可追溯</strong><small>公告原文优先</small></article>
-            </div>
+              {(profile.company_name || profile.main_business || profile.industry) && (
+                <article className="panel profile-panel">
+                  <div className="panel-title"><div><span>COMPANY PROFILE</span><h3>主要业务与基本信息</h3></div></div>
+                  {profile.main_business && <p className="business-copy">{String(profile.main_business.value)}</p>}
+                  <dl className="profile-grid">
+                    {[
+                      ["公司全称", profile.company_name],
+                      ["所属行业", profile.industry],
+                      ["法定代表人", profile.legal_representative],
+                      ["注册资本", profile.registered_capital],
+                      ["上市日期", profile.listing_date],
+                      ["办公地址", profile.office_address],
+                    ].map(([label, item]) => item && (
+                      <div key={String(label)}>
+                        <dt>{label}</dt>
+                        <dd>{String((item as Sourced).value)}</dd>
+                        <SourceLink sourceId={(item as Sourced).source_id} sources={sources} compact />
+                      </div>
+                    ))}
+                  </dl>
+                </article>
+              )}
 
-            <div className="two-column">
-              <article className="panel">
-                <div className="panel-title"><div><span>OWNERSHIP</span><h3>主要股东构成</h3></div><small>期末持股口径</small></div>
-                <div className="ownership-bar">
-                  {active.shareholders.map((holder, index) => (
-                    <i key={holder.name} style={{ width: holder.ratio, background: index === 0 ? active.color : `color-mix(in srgb, ${active.color} ${70 - index * 10}%, #d7ded9)` }} />
-                  ))}
+              {latestShareholders.length > 0 && (
+                <article className="panel">
+                  <div className="panel-title">
+                    <div><span>OWNERSHIP</span><h3>前十大股东</h3></div>
+                    <small>{latestShareholderPeriod}</small>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>股东</th><th>类型</th><th>持股数量</th><th>持股比例</th><th>较上期</th><th>来源</th></tr></thead>
+                      <tbody>{latestShareholders.map((holder, index) => (
+                        <tr key={`${holder.name}-${index}`}>
+                          <td>{holder.name ?? "—"}</td>
+                          <td>{holder.holder_type ?? "—"}</td>
+                          <td>{formatNumber(holder.shares)}</td>
+                          <td>{holder.ratio_percent == null ? "—" : `${formatNumber(holder.ratio_percent)}%`}</td>
+                          <td>{holder.change ?? "—"}</td>
+                          <td><SourceLink sourceId={holder.source_id} sources={sources} compact /></td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </article>
+              )}
+
+              {segments.length > 0 && (
+                <article className="panel">
+                  <div className="panel-title">
+                    <div><span>REVENUE MIX</span><h3>主要产品 / 业务收入</h3></div>
+                    <small>{segments[0]?.period}</small>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>分类</th><th>产品或业务</th><th>营业收入</th><th>收入占比</th><th>毛利率</th><th>来源</th></tr></thead>
+                      <tbody>{segments.map((segment, index) => (
+                        <tr key={`${segment.name}-${index}`}>
+                          <td>{segment.category_type ?? "—"}</td>
+                          <td>{segment.name}</td>
+                          <td>{formatMoney(segment.revenue)}</td>
+                          <td>{segment.revenue_share_percent == null ? "—" : `${formatNumber(segment.revenue_share_percent)}%`}</td>
+                          <td>{segment.gross_margin_percent == null ? "—" : `${formatNumber(segment.gross_margin_percent)}%`}</td>
+                          <td><SourceLink sourceId={segment.source_id} sources={sources} compact /></td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </article>
+              )}
+            </section>
+          )}
+
+          {margin.length > 0 && (
+            <section className="report-section" id="capital">
+              <div className="section-heading">
+                <div><span>20 TRADING DAYS</span><h2>融资融券资金面</h2></div>
+                <p>逐股官方两融明细；融资余额日变化为相邻交易日余额之差。</p>
+              </div>
+              <article className="panel chart-panel">
+                <div className="panel-title">
+                  <div><span>FINANCING BALANCE CHANGE</span><h3>融资余额日变化</h3></div>
+                  <SourceLink sourceId={margin[0]?.source_id} sources={sources} />
                 </div>
+                <div className="bar-chart" aria-label="最近20个交易日融资余额日变化">
+                  {margin.map((row) => {
+                    const value = Number(row.financing_balance_change ?? 0);
+                    const max = Math.max(...margin.map((item) => Math.abs(Number(item.financing_balance_change ?? 0))), 1);
+                    return (
+                      <div key={row.date} title={`${row.date} ${formatMoney(value)}`}>
+                        <i className={value >= 0 ? "up" : "down"} style={{ height: `${8 + Math.abs(value) / max * 82}px` }} />
+                        <small>{row.date.slice(5)}</small>
+                      </div>
+                    );
+                  })}
+                  <span className="zero-line" />
+                </div>
+              </article>
+              <article className="panel">
+                <div className="panel-title"><div><span>DAILY LEDGER</span><h3>逐日融资融券明细</h3></div></div>
                 <div className="table-wrap">
                   <table>
-                    <thead><tr><th>股东</th><th>类型</th><th>持股</th><th>较上期</th></tr></thead>
-                    <tbody>{active.shareholders.map((holder) => (
-                      <tr key={holder.name}><td>{holder.name}</td><td>{holder.kind}</td><td>{holder.ratio}</td><td className={holder.change.startsWith("+") ? "positive" : holder.change.startsWith("−") ? "negative" : ""}>{holder.change}</td></tr>
+                    <thead><tr><th>交易日</th><th>融资买入</th><th>融资偿还</th><th>融资余额变化</th><th>融资余额</th><th>融券卖出量</th><th>融券余额/余量</th><th>来源</th></tr></thead>
+                    <tbody>{[...margin].reverse().map((row) => (
+                      <tr key={row.date}>
+                        <td>{row.date}</td>
+                        <td>{formatMoney(row.financing_buy)}</td>
+                        <td>{formatMoney(row.financing_repay)}</td>
+                        <td className={(row.financing_balance_change ?? 0) >= 0 ? "positive" : "negative"}>
+                          {formatMoney(row.financing_balance_change)}
+                        </td>
+                        <td>{formatMoney(row.financing_balance)}</td>
+                        <td>{formatNumber(row.securities_lending_sell)}</td>
+                        <td>{formatNumber(row.securities_lending_balance)}</td>
+                        <td><SourceLink sourceId={row.source_id} sources={sources} compact /></td>
+                      </tr>
                     ))}</tbody>
                   </table>
                 </div>
               </article>
+            </section>
+          )}
 
-              <article className="panel business-summary">
-                <div className="panel-title"><div><span>BUSINESS MODEL</span><h3>这家公司主要做什么</h3></div></div>
-                <p>{active.business}</p>
-                <div className="evidence-note">
-                  <b>核验路径</b>
-                  <span>年报“管理层讨论与分析” → 分行业/分产品收入 → 同业公司年报交叉核验</span>
-                </div>
-                <a href="https://www.cninfo.com.cn/new/index" target="_blank" rel="noreferrer">在巨潮资讯检索原报告 ↗</a>
-              </article>
-            </div>
-          </section>
-
-          <section id="capital" className="report-section">
-            <div className="section-heading">
-              <div><span>30-DAY CAPITAL</span><h2>近一个月资金面</h2></div>
-              <p>逐日披露融资融券变化；机构资金仅展示可验证的持仓披露与公开交易席位。</p>
-            </div>
-            <div className="capital-cards">
-              <article><span>融资余额期末</span><strong>86.42 亿元</strong><small className="positive">月内 +5.8%</small></article>
-              <article><span>融资净买入累计</span><strong>12.31 亿元</strong><small>20 个交易日</small></article>
-              <article><span>融券余额期末</span><strong>1.08 亿元</strong><small className="negative">月内 −8.4%</small></article>
-              <article><span>可验证机构信号</span><strong>3 条</strong><small>季报持仓 / 龙虎榜</small></article>
-            </div>
-
-            <div className="capital-layout">
+          {peerRows.length > 0 && (
+            <section className="report-section" id="peers">
+              <div className="section-heading">
+                <div><span>PEER SET</span><h2>{active.peers?.data.label ?? "同业可比公司"}</h2></div>
+                <p>行业归属来自官方披露；同业成份为二手行业板块匹配，不自动称为“竞争对手”。</p>
+              </div>
               <article className="panel">
-                <div className="panel-title"><div><span>DAILY CHANGE</span><h3>融资余额日变化</h3></div><small>亿元 · 演示</small></div>
-                <div className="bar-chart" aria-label="近20个交易日融资余额变化柱状图">
-                  {flows.map((value, index) => (
-                    <div key={tradingDates[index]}>
-                      <i className={value >= 0 ? "up" : "down"} style={{ height: `${Math.abs(value) * 10 + 8}px` }} />
-                      {index % 4 === 0 && <small>{tradingDates[index]}</small>}
-                    </div>
-                  ))}
-                  <span className="zero-line" />
-                </div>
-                <div className="chart-legend"><span><i className="up" /> 融资余额增加</span><span><i className="down" /> 融资余额减少</span></div>
-              </article>
-
-              <article className="panel institution-panel">
-                <div className="panel-title"><div><span>INSTITUTIONAL SIGNALS</span><h3>机构资金：可验证信号</h3></div></div>
-                <div className="signal">
-                  <span className="signal-icon">季</span><div><b>前十大股东持仓变化</b><p>香港中央结算名义持仓较上期变化 {active.shareholders[2]?.change ?? "—"}；真实机构身份需结合定期报告。</p></div>
-                </div>
-                <div className="signal">
-                  <span className="signal-icon">榜</span><div><b>机构专用席位</b><p>仅在达到交易公开信息条件时披露，不代表全市场每日机构净买卖。</p></div>
-                </div>
-                <div className="signal caution">
-                  <span className="signal-icon">!</span><div><b>不把“大单净流入”写成机构净流入</b><p>商业平台算法可作为辅助观察，但必须单独标为估算指标。</p></div>
-                </div>
-              </article>
-            </div>
-
-            <article className="panel daily-table">
-              <div className="panel-title"><div><span>DAILY LEDGER</span><h3>逐日融资融券明细</h3></div><button>导出 CSV</button></div>
-              <div className="table-wrap">
-                <table>
-                  <thead><tr><th>交易日</th><th>融资买入</th><th>融资偿还</th><th>融资净买入</th><th>融资余额</th><th>融券卖出</th><th>融券余量</th><th>来源</th></tr></thead>
-                  <tbody>{tradingDates.slice().reverse().map((date, index) => {
-                    const value = flows[flows.length - 1 - index];
-                    return (
-                      <tr key={date}>
-                        <td>2025-{date}</td><td>{(8.2 + index * .17).toFixed(2)} 亿</td><td>{(7.4 + index * .13).toFixed(2)} 亿</td>
-                        <td className={value >= 0 ? "positive" : "negative"}>{value >= 0 ? "+" : ""}{value.toFixed(2)} 亿</td>
-                        <td>{(86.42 - index * .24).toFixed(2)} 亿</td><td>{(210 + index * 11).toFixed(0)} 万</td><td>{(73 - index * 1.4).toFixed(1)} 万</td>
-                        <td><a href={active.code.startsWith("3") || active.code.startsWith("0") ? "https://www.szse.cn/www/marketServices/deal/finance/index.html" : "https://www.sse.com.cn/market/othersdata/margin/sum/"} target="_blank" rel="noreferrer">交易所 ↗</a></td>
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>公司</th><th>代码</th><th>最新价</th><th>总市值</th><th>来源</th></tr></thead>
+                    <tbody>{peerRows.map((peer) => (
+                      <tr key={peer.code}>
+                        <td>{peer.name ?? "—"}</td>
+                        <td>{peer.code}</td>
+                        <td>{formatNumber(peer.latest_price)}</td>
+                        <td>{formatMoney(peer.market_cap)}</td>
+                        <td><SourceLink sourceId={peer.source_id} sources={sources} compact /></td>
                       </tr>
-                    );
-                  })}</tbody>
-                </table>
-              </div>
-            </article>
-          </section>
-
-          <section id="business" className="report-section">
-            <div className="section-heading">
-              <div><span>OPERATIONS & FINANCIALS</span><h2>主营业务与关键科目</h2></div>
-              <p>同时观察收入结构、预收安排和回款质量，避免只看净利润。</p>
-            </div>
-            <div className="two-column business-grid">
-              <article className="panel">
-                <div className="panel-title"><div><span>REVENUE MIX</span><h3>主要产品 / 业务收入</h3></div><small>{active.reportDate}</small></div>
-                <div className="segment-list">
-                  {active.segments.map((segment) => (
-                    <div key={segment.name}>
-                      <div><b>{segment.name}</b><span>{segment.revenue} <small className={segment.yoy.startsWith("+") ? "positive" : "negative"}>{segment.yoy}</small></span></div>
-                      <div className="segment-track"><i style={{ width: `${segment.share}%`, background: active.color }} /><small>{segment.share}%</small></div>
-                    </div>
-                  ))}
+                    ))}</tbody>
+                  </table>
                 </div>
               </article>
+            </section>
+          )}
+
+          {contractRows.length > 0 && (
+            <section className="report-section" id="contracts">
+              <div className="section-heading">
+                <div><span>24-MONTH DISCLOSURES</span><h2>合同 / 中标 / 订单公告</h2></div>
+                <p>金额和交易对手只在公告文本可确定识别时显示；未披露字段保持空白。</p>
+              </div>
               <article className="panel">
-                <div className="panel-title"><div><span>WORKING CAPITAL</span><h3>合同负债与应收账款</h3></div><small>期末余额</small></div>
-                <div className="balance-list">
-                  {active.balance.map((item) => (
-                    <div key={item.label}>
-                      <span>{item.label}<small>{item.note}</small></span>
-                      <b>{item.current}<small>上期 {item.previous}</small></b>
-                      <i className={item.change.startsWith("+") ? "positive" : item.change.startsWith("−") ? "negative" : ""}>{item.change}</i>
-                    </div>
-                  ))}
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>公告日期</th><th>公告标题</th><th>交易对手</th><th>金额原文</th><th>原文</th></tr></thead>
+                    <tbody>{contractRows.map((row, index) => (
+                      <tr key={`${row.published_at}-${index}`}>
+                        <td>{row.published_at ?? "—"}</td>
+                        <td>{row.title}</td>
+                        <td>{row.counterparty ?? ""}</td>
+                        <td>{row.amount_text ?? ""}</td>
+                        <td><a className="source-link compact" href={row.url} target="_blank" rel="noreferrer">公告 ↗</a></td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
                 </div>
               </article>
-            </div>
-          </section>
+            </section>
+          )}
 
-          <section id="peers" className="report-section">
+          <section className="report-section" id="sources">
             <div className="section-heading">
-              <div><span>PEER SET</span><h2>主要同业竞争对手</h2></div>
-              <p>同行名单来自行业分类、公司年报竞争格局和主营收入可比性，不由模型自由生成。</p>
+              <div><span>SOURCE STATUS</span><h2>来源、状态与缺失项</h2></div>
+              <p>二手来源只承担结构化连接，页面明确标记来源层级并尽可能回链官方原报告。</p>
             </div>
-            <article className="panel">
-              <div className="table-wrap">
-                <table className="peer-table">
-                  <thead><tr><th>公司</th><th>可比定位</th><th>营业收入</th><th>归母净利润</th><th>演示净利率</th><th>比较依据</th></tr></thead>
-                  <tbody>
-                    <tr className="active-company"><td><b>{active.name}</b><small>{active.code}</small></td><td>{active.tag} · 当前公司</td><td>{active.revenue}</td><td>{active.profit}</td><td>—</td><td>公司年报</td></tr>
-                    {active.peers.map((peer) => (
-                      <tr key={peer.code}><td><b>{peer.name}</b><small>{peer.code}</small></td><td>{peer.position}</td><td>{peer.revenue}</td><td>{peer.profit}</td><td>{peer.margin}</td><td>同业年报</td></tr>
-                    ))}
-                  </tbody>
-                </table>
+            <div className="module-status">
+              <div><b>公司总览</b><StatusBadge response={active.overview} /></div>
+              <div><b>资金面</b><StatusBadge response={active.capital} /></div>
+              <div><b>合同公告</b><StatusBadge response={active.contracts} /></div>
+              <div><b>同业</b><StatusBadge response={active.peers} /></div>
+            </div>
+            {allWarnings.length > 0 && (
+              <div className="warnings">
+                {allWarnings.map((warning, index) => <p key={index}>{warning}</p>)}
               </div>
-            </article>
-          </section>
-
-          <section id="contracts" className="report-section">
-            <div className="section-heading">
-              <div><span>MATERIAL CONTRACTS</span><h2>主要业务合同</h2></div>
-              <p>只收录达到披露标准或公司主动公告的合同；“未披露”不自动推算金额。</p>
-            </div>
-            <article className="panel contracts">
-              {active.contracts.map((contract) => (
-                <div key={`${contract.date}${contract.title}`}>
-                  <time>{contract.date}</time>
-                  <span className="status">{contract.status}</span>
-                  <section><b>{contract.title}</b><p>交易对手：{contract.counterparty}</p></section>
-                  <section><small>合同金额</small><strong>{contract.amount}</strong></section>
-                  <section><small>占上年营收</small><strong>{contract.ratio}</strong></section>
-                  <a href="https://www.cninfo.com.cn/new/disclosure" target="_blank" rel="noreferrer" aria-label="查看公告原文">公告 ↗</a>
+            )}
+            {sources.size > 0 && (
+              <article className="panel">
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>层级</th><th>发布机构</th><th>原文标题</th><th>报告期</th><th>发布日期</th><th>抓取时间</th></tr></thead>
+                    <tbody>{[...sources.values()].map((item) => (
+                      <tr key={item.source_id}>
+                        <td><span className={`tier ${item.tier}`}>{item.tier === "official" ? "官方" : "二手"}</span></td>
+                        <td>{item.publisher}</td>
+                        <td><a className="source-link" href={item.url} target="_blank" rel="noreferrer">{item.title} ↗</a></td>
+                        <td>{item.period ?? "—"}</td>
+                        <td>{item.published_at ?? "—"}</td>
+                        <td>{new Date(item.retrieved_at).toLocaleString("zh-CN")}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
                 </div>
-              ))}
-            </article>
+              </article>
+            )}
           </section>
-
-          <section id="sources" className="report-section sources-section">
-            <div className="section-heading">
-              <div><span>PROVENANCE</span><h2>来源、口径与现有方案盘点</h2></div>
-              <p>“官方原文”负责证据，“结构化接口”负责效率，“模型”只负责抽取与解释。</p>
-            </div>
-            <div className="source-grid">
-              <a href="https://www.cninfo.com.cn/new/index" target="_blank" rel="noreferrer"><b>巨潮资讯</b><span>法定信息披露平台</span><small>年报、季报、临时公告、重大合同</small></a>
-              <a href="https://www.sse.com.cn/" target="_blank" rel="noreferrer"><b>上海证券交易所</b><span>官方交易与披露</span><small>两融、公开交易信息、公司公告</small></a>
-              <a href="https://www.szse.cn/" target="_blank" rel="noreferrer"><b>深圳证券交易所</b><span>官方交易与披露</span><small>两融、龙虎榜、公司信息</small></a>
-              <a href="https://www.bse.cn/" target="_blank" rel="noreferrer"><b>北京证券交易所</b><span>官方交易与披露</span><small>北交所公司与融资融券</small></a>
-            </div>
-
-            <article className="panel landscape">
-              <div className="panel-title"><div><span>LANDSCAPE AUDIT</span><h3>现有网页 / 模型 / 开源工具</h3></div><small>2026-07 调研</small></div>
-              <div className="table-wrap">
-                <table>
-                  <thead><tr><th>方案</th><th>擅长</th><th>对本需求的缺口</th><th>建议</th></tr></thead>
-                  <tbody>
-                    <tr><td><b>Wind / iFinD / Choice</b></td><td>结构化财务、股东、行情与行业数据</td><td>付费授权；逐项官方原文追溯与合同抽取方式不透明</td><td><span className="badge amber">可选数据授权</span></td></tr>
-                    <tr><td><b>AKShare / Tushare / OpenBB 扩展</b></td><td>A 股接口接入、研究原型、批量数据</td><td>多项字段来自商业网页二次整理，不等于官方源</td><td><span className="badge green">可作索引与缓存</span></td></tr>
-                    <tr><td><b>FinGPT / FinRobot / TradingAgents-CN</b></td><td>金融问答、多智能体研报、交易观点</td><td>不专门解决 A 股官方披露溯源；容易把推断写成事实</td><td><span className="badge gray">只复用编排思路</span></td></tr>
-                    <tr><td><b>OpenAshare / DSA / Market Lens</b></td><td>单股分析、技术指标、新闻与 AI 摘要</td><td>合同、应收与同业证据链覆盖不足；口径与本项目不同</td><td><span className="badge gray">参考交互，不直接集成</span></td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </article>
-
-            <div className="method-note">
-              <b>口径红线</b>
-              <p>融资融券是交易所日频数据；前十大股东与机构持仓主要是报告期数据；“主力资金净流入”通常由商业平台按成交单推算，不能标成真实机构每日增减。</p>
-            </div>
-          </section>
-        </div>
-      </section>
+        </section>
+      )}
 
       <footer>
-        <div className="brand"><span className="brand-mark">析</span><span><b>A股公司研究台</b><small>从披露事实到可验证判断</small></span></div>
-        <p>原型版本 · 数据不构成投资建议 · 正式版将保留每条记录的来源链接、报告期与抓取时间</p>
+        <p>
+          本工具构建了一套面向沪深北 A 股公开披露的可复核信息整合流程。系统以公司名称或证券代码为检索键，
+          将公司概况、财务报表、股东、主营构成、两融、合同公告与同业资料分模块采集；每个字段通过 source_id
+          关联发布机构、原文、报告期、发布日期与抓取时间，并区分官方与二手结构化来源。系统仅执行确定性抽取与
+          口径对齐，不对缺失项进行生成式补全；跨公司比较限于最近共同完整年度。因此，输出用于公开信息研究与
+          审计追踪，不构成投资建议，结论应以原始披露为准。
+        </p>
+        <span>METHODS ABSTRACT</span>
       </footer>
     </main>
   );

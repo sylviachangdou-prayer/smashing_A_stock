@@ -1,98 +1,49 @@
-# vinext-starter
+# A股公司研究台（本地试用版）
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+按公司名称或六位代码查询沪深北 A 股公开信息。前端只渲染实际取得且带 `source_id` 的数据；上游缺失或超时会按模块单独显示，不生成替代值。
 
-## Prerequisites
+## 本地启动
 
-- Node.js `>=22.13.0`
-
-## Quick Start
+需要 Node.js 22+、Python 3.12 和 [`uv`](https://docs.astral.sh/uv/)。
 
 ```bash
 npm install
-npm run dev
-npm run build
+npm run local
 ```
 
-This starter does not use `wrangler.jsonc`.
+- 页面：<http://localhost:3000>
+- 数据服务：<http://127.0.0.1:8010>
+- 健康检查：<http://127.0.0.1:8010/api/health>
 
-## Included Shape
+首次运行会由 `uv` 按 `uv.lock` 安装 Python 依赖。代码表、财务、股东、两融和公告会写入 `.cache/stock_tool/`，页面中的“绕过缓存刷新”可重新抓取公司模块。
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+## 接口
 
-## Workspace Auth Headers
+- `GET /api/search?q=`
+- `GET /api/company/{code}/overview`
+- `GET /api/company/{code}/capital?days=20`
+- `GET /api/company/{code}/contracts?months=24`
+- `GET /api/company/{code}/peers`
+- `GET /api/health`
 
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
+所有接口统一返回：
 
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
+```json
+{
+  "data": {},
+  "sources": [],
+  "warnings": [],
+  "as_of": "ISO-8601",
+  "status": "ok | partial | empty | error"
 }
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+## 验证
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+```bash
+npm run lint
+npm test
+npm run test:api
+```
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+本项目不使用 OpenAI API，不包含商业数据授权，也不构成投资建议。

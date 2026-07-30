@@ -1,91 +1,70 @@
 import assert from "node:assert/strict";
-import { access, readFile, readdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const developmentPreviewMeta =
-  /<meta(?=[^>]*\bname=["']codex-preview["'])(?=[^>]*\bcontent=["']development["'])[^>]*>/i;
-const templateRoot = new URL("../", import.meta.url);
-const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
+const pageUrl = new URL("../app/page.tsx", import.meta.url);
+const backendUrl = new URL("../backend/main.py", import.meta.url);
 
-async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
-}
-
-test("server-renders the starter loading skeleton", async () => {
-  const response = await render();
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-
-  const html = await response.text();
-  assert.match(html, developmentPreviewMeta);
-  assert.match(html, /<title>Your site is taking shape<\/title>/i);
-  assert.match(html, /Building your site/);
-  assert.match(html, /Your site is taking shape/);
-  assert.match(
-    html,
-    /Your first version will appear here automatically when it’s ready\./,
-  );
-  assert.doesNotMatch(html, /Codex/);
-  assert.match(html, /react-loading-skeleton/);
-  assert.match(html, /role="status"/);
+test("removes hard-coded demonstration companies and values", async () => {
+  const page = await readFile(pageUrl, "utf8");
+  assert.doesNotMatch(page, /const companies|const flows|整车客户 A|演示市值|86\.42 亿元/);
+  assert.doesNotMatch(page, /尚未选择公司|从名称或代码开始查询/);
+  assert.match(page, /今日全球财经头条/);
 });
 
-test("keeps the loading skeleton scoped and disposable", async () => {
-  const [preview, css, page, layout, packageJson, files] = await Promise.all([
-    readFile(new URL("SkeletonPreview.tsx", previewRoot), "utf8"),
-    readFile(new URL("preview.css", previewRoot), "utf8"),
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../package.json", import.meta.url), "utf8"),
-    readdir(previewRoot),
+test("renders numerical modules through source-linked response fields", async () => {
+  const page = await readFile(pageUrl, "utf8");
+  assert.match(page, /type Sourced/);
+  assert.match(page, /source_id: string/);
+  assert.match(page, /SourceLink/);
+  assert.match(page, /common.*annual|共同完整年度/is);
+});
+
+test("submitting a company search performs a fresh API lookup", async () => {
+  const page = await readFile(pageUrl, "utf8");
+  const submitSearch = page.slice(
+    page.indexOf("async function submitSearch"),
+    page.indexOf("function removeCompany"),
+  );
+  assert.match(submitSearch, /searchCompanies\(keyword\)/);
+  assert.doesNotMatch(submitSearch, /if \(suggestions\[0\]\)/);
+});
+
+test("source mode selector changes backend collection rules", async () => {
+  const [page, backend] = await Promise.all([
+    readFile(pageUrl, "utf8"),
+    readFile(backendUrl, "utf8"),
   ]);
+  for (const mode of ["official", "strict", "structured"]) {
+    assert.match(page, new RegExp(`${mode}:`));
+  }
+  assert.match(page, /mode=\$\{mode\}/);
+  assert.match(backend, /SourceMode = Literal\["official", "strict", "structured"\]/);
+  assert.match(backend, /mode: SourceMode = "official"/);
+});
 
-  assert.deepEqual(files.sort(), ["SkeletonPreview.tsx", "preview.css"]);
-  assert.match(preview, /from "react-loading-skeleton"/);
-  assert.match(preview, /baseColor="#eceae7"/);
-  assert.match(preview, /highlightColor="#f9f8f6"/);
-  assert.match(preview, /duration=\{2\.8\}/);
-  assert.match(preview, /sites-skeleton-search-placeholder/);
-  assert.match(packageJson, /"react-loading-skeleton": "3\.5\.0"/);
+test("keeps configurable company search history in browser storage", async () => {
+  const page = await readFile(pageUrl, "utf8");
+  assert.match(page, /历史搜索/);
+  assert.match(page, /HISTORY_LIMITS = \[5, 10, 20, 50\]/);
+  assert.match(page, /localStorage/);
+  assert.match(page, /预计仍需约/);
+});
 
-  const shellIndex = preview.indexOf('className="sites-skeleton-shell"');
-  const statusIndex = preview.indexOf('className="sites-skeleton-status"');
-  assert.ok(shellIndex >= 0 && statusIndex > shellIndex);
-  assert.match(css, /position:\s*fixed/);
-  assert.match(css, /inset:\s*0/);
-  assert.match(css, /opacity:\s*0\.52/);
-  assert.match(css, /prefers-reduced-motion:\s*reduce/);
-  assert.doesNotMatch(css, /#020617|canvas|pets|progress/i);
-  assert.doesNotMatch(
-    preview,
-    /loading-spinner|status-mark|status-progress|canvas|cookie|random/i,
-  );
-
-  assert.match(page, /export const metadata:\s*Metadata/);
-  assert.match(page, /"codex-preview": "development"/);
-  assert.match(page, /<SkeletonPreview \/>/);
-  assert.match(layout, /title:\s*"Starter Project"/);
-  assert.doesNotMatch(layout, /codex-preview|_sites-preview|themeColor|\bViewport\b/);
-  assert.doesNotMatch(css, /(^|\s)(html|body)\s*\{/m);
-
-  await assert.rejects(
-    access(new URL("public/_sites-preview", templateRoot)),
-  );
+test("backend exposes the required independent endpoints and response envelope", async () => {
+  const backend = await readFile(backendUrl, "utf8");
+  for (const route of [
+    "/api/search",
+    "/api/market-brief",
+    "/api/company/{raw_code}/overview",
+    "/api/company/{raw_code}/capital",
+    "/api/company/{raw_code}/contracts",
+    "/api/company/{raw_code}/peers",
+    "/api/health",
+  ]) {
+    assert.match(backend, new RegExp(route.replace(/[{}]/g, "\\$&")));
+  }
+  for (const key of ["data", "sources", "warnings", "as_of", "status"]) {
+    assert.match(backend, new RegExp(`"${key}"`));
+  }
 });
