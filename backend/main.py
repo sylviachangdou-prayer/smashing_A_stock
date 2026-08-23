@@ -3,12 +3,15 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import re
+import ssl
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Callable, Literal
 
 import akshare as ak
@@ -16,7 +19,11 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pypdf import PdfReader
+from requests.adapters import HTTPAdapter
+from urllib.parse import urljoin
+from urllib3 import PoolManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,10 +31,18 @@ CACHE_DIR = ROOT / ".cache" / "stock_tool"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CNINFO_HOME = "https://www.cninfo.com.cn/new/index"
 EASTMONEY_QUOTE = "https://quote.eastmoney.com/"
+EASTMONEY_F10 = "https://emweb.securities.eastmoney.com/PC_HSF10"
+EASTMONEY_DATACENTER = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+THS_F10 = "https://basic.10jqka.com.cn/new"
+BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ = timezone(timedelta(hours=8))
 CNINFO_JS_LOCK = Lock()
+CNINFO_QUERY_LOCK = Lock()
+CACHE_LOCKS: dict[str, Lock] = {}
+CACHE_LOCK_GUARD = Lock()
 _REQUEST = requests.sessions.Session.request
 SourceMode = Literal["official", "strict", "structured"]
+SearchScope = Literal["current", "extended"]
 
 
 def _request_with_default_timeout(self: requests.Session, method: str, url: str, **kwargs: Any):
@@ -36,6 +51,20 @@ def _request_with_default_timeout(self: requests.Session, method: str, url: str,
 
 
 requests.sessions.Session.request = _request_with_default_timeout
+
+
+class TLS12Adapter(HTTPAdapter):
+    def init_poolmanager(self, connections: int, maxsize: int, block: bool = False, **kwargs: Any):
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        kwargs["ssl_context"] = context
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **kwargs,
+        )
 
 app = FastAPI(title="A股信息查询本地服务", version="0.1.0")
 app.add_middleware(
@@ -67,13 +96,34 @@ def cache_file(key: str) -> Path:
     return CACHE_DIR / f"{safe}.json"
 
 
+def cache_lock(key: str) -> Lock:
+    with CACHE_LOCK_GUARD:
+        return CACHE_LOCKS.setdefault(key, Lock())
+
+
 def cached(key: str, ttl_seconds: int, loader: Callable[[], Any], refresh: bool = False) -> Any:
     path = cache_file(key)
-    if not refresh and path.exists() and time.time() - path.stat().st_mtime < ttl_seconds:
-        return json.loads(path.read_text(encoding="utf-8"))
-    value = loader()
-    path.write_text(json.dumps(value, ensure_ascii=False, default=clean_scalar), encoding="utf-8")
-    return value
+
+    def read_fresh() -> Any:
+        if not path.exists() or time.time() - path.stat().st_mtime >= ttl_seconds:
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    if not refresh:
+        value = read_fresh()
+        if value is not None:
+            return value
+    with cache_lock(key):
+        if not refresh:
+            value = read_fresh()
+            if value is not None:
+                return value
+        value = loader()
+        _write_json_atomic(path, value)
+        return value
 
 
 def frame_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -171,7 +221,27 @@ MASTER_SOURCES = {
     "bse-stock-list": ("北京证券交易所", "北交所股票列表", "https://www.bse.cn/nq/listedcompany.html", "official"),
     "eastmoney-stock-list": ("东方财富", "沪深北 A 股行情代码表", "https://quote.eastmoney.com/center/gridlist.html", "secondary"),
     "sina-stock-list": ("新浪财经", "沪深 A 股行情代码表", "https://vip.stock.finance.sina.com.cn/mkt/", "secondary"),
+    "cninfo-company-list": (
+        "巨潮资讯",
+        "证券简称与代码列表",
+        "https://www.cninfo.com.cn/new/data/szse_stock.json",
+        "official",
+    ),
 }
+MASTER_OFFICIAL_SOURCE = {
+    "SSE": "sse-stock-list",
+    "SZSE": "szse-stock-list",
+    "BSE": "bse-stock-list",
+}
+MASTER_SOURCE_PRIORITY = {
+    "sse-stock-list": 0,
+    "szse-stock-list": 0,
+    "bse-stock-list": 0,
+    "eastmoney-stock-list": 1,
+    "sina-stock-list": 2,
+}
+STOCK_MASTER_TTL = 24 * 3600
+STOCK_MASTER_REFRESH_LOCK = Lock()
 
 
 def master_source(source_id: str) -> dict[str, Any]:
@@ -179,85 +249,327 @@ def master_source(source_id: str) -> dict[str, Any]:
     return source(source_id, publisher, title, url, tier=tier)
 
 
-def stock_master(refresh: bool = False) -> list[dict[str, str]]:
-    def load() -> list[dict[str, str]]:
-        batches: list[tuple[list[dict[str, Any]], str]] = []
+def szse_a_share_list() -> list[dict[str, Any]]:
+    session = requests.Session()
+    session.mount("https://www.szse.cn", TLS12Adapter())
+    response_value = session.get(
+        "https://www.szse.cn/api/report/ShowReport",
+        params={
+            "SHOWTYPE": "xlsx",
+            "CATALOGID": "1110",
+            "TABKEY": "tab1",
+            "random": "0.6935816432433362",
+        },
+        headers={
+            "Referer": "https://www.szse.cn/market/product/stock/list/index.html",
+            "User-Agent": "Mozilla/5.0",
+        },
+        timeout=20,
+    )
+    response_value.raise_for_status()
+    frame = pd.read_excel(io.BytesIO(response_value.content))
+    frame["A股代码"] = (
+        frame["A股代码"]
+        .astype(str)
+        .str.split(".", expand=True)
+        .iloc[:, 0]
+        .str.zfill(6)
+    )
+    return frame_records(frame)
+
+
+def normalize_master_batch(
+    rows: list[dict[str, Any]], source_id: str
+) -> list[dict[str, str]]:
+    output: list[dict[str, str]] = []
+    for row in rows:
+        raw_code = str(
+            row.get("code")
+            or row.get("代码")
+            or row.get("证券代码")
+            or row.get("A股代码")
+            or ""
+        )
+        code_match = re.search(r"(\d{6})", raw_code.split(".")[0])
+        code = code_match.group(1) if code_match else ""
+        name = str(
+            row.get("name")
+            or row.get("名称")
+            or row.get("证券简称")
+            or row.get("A股简称")
+            or ""
+        ).strip()
+        if not re.fullmatch(r"\d{6}", code) or not name:
+            continue
+        output.append(
+            {
+                "code": code,
+                "name": name,
+                "exchange": exchange_for(code),
+                "market": market_label(code),
+                "source_id": source_id,
+            }
+        )
+    return output
+
+
+def merge_stock_master_batches(
+    batches: list[tuple[list[dict[str, Any]], str]],
+    official_sources: set[str],
+    stale: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    current: list[dict[str, str]] = []
+    for rows, source_id in batches:
+        current.extend(normalize_master_batch(rows, source_id))
+    current.sort(key=lambda item: MASTER_SOURCE_PRIORITY[item["source_id"]])
+
+    output: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in current:
+        if item["code"] not in seen:
+            seen.add(item["code"])
+            output.append(item)
+
+    missing_official_exchanges = {
+        exchange
+        for exchange, source_id in MASTER_OFFICIAL_SOURCE.items()
+        if source_id not in official_sources
+    }
+    for item in stale or []:
+        if (
+            item.get("exchange") in missing_official_exchanges
+            and item.get("code") not in seen
+            and item.get("source_id") in MASTER_SOURCES
+        ):
+            seen.add(item["code"])
+            output.append(item)
+    return sorted(output, key=lambda item: item["code"])
+
+
+def _read_stock_master_cache() -> list[dict[str, str]]:
+    path = cache_file("stock_master")
+    if not path.exists():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    temporary = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, default=clean_scalar),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
+    with STOCK_MASTER_REFRESH_LOCK:
         official_loaders = (
             (lambda: frame_records(ak.stock_info_sh_name_code(symbol="主板A股")), "sse-stock-list"),
             (lambda: frame_records(ak.stock_info_sh_name_code(symbol="科创板")), "sse-stock-list"),
-            (lambda: frame_records(ak.stock_info_sz_name_code(symbol="A股列表")), "szse-stock-list"),
+            (szse_a_share_list, "szse-stock-list"),
             (lambda: frame_records(ak.stock_info_bj_name_code()), "bse-stock-list"),
         )
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        batches: list[tuple[list[dict[str, Any]], str]] = []
+        successful_sources: set[str] = set()
+        with ThreadPoolExecutor(max_workers=len(official_loaders)) as pool:
             future_sources = {pool.submit(loader): source_id for loader, source_id in official_loaders}
             for future in as_completed(future_sources):
                 try:
                     rows = future.result()
                     if rows:
-                        batches.append((rows, future_sources[future]))
+                        source_id = future_sources[future]
+                        batches.append((rows, source_id))
+                        successful_sources.add(source_id)
                 except Exception:
                     continue
-        covered = {source_id for _, source_id in batches}
-        missing_exchange = {
-            "SSE": "sse-stock-list" not in covered,
-            "SZSE": "szse-stock-list" not in covered,
-            "BSE": "bse-stock-list" not in covered,
-        }
-        if any(missing_exchange.values()):
-            for loader, source_id in (
-                (ak.stock_zh_a_spot_em, "eastmoney-stock-list"),
-                (ak.stock_zh_a_spot, "sina-stock-list"),
-            ):
-                try:
-                    fallback = frame_records(loader())
-                    if fallback:
-                        batches.append((fallback, source_id))
-                        break
-                except Exception:
-                    continue
-        output: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for rows, source_id in batches:
-            for row in rows:
-                raw_code = str(
-                    row.get("code")
-                    or row.get("代码")
-                    or row.get("证券代码")
-                    or row.get("A股代码")
-                    or ""
-                )
-                code_match = re.search(r"(\d{6})", raw_code.split(".")[0])
-                code = code_match.group(1) if code_match else ""
-                name = str(
-                    row.get("name")
-                    or row.get("名称")
-                    or row.get("证券简称")
-                    or row.get("A股简称")
-                    or ""
-                ).strip()
-                exchange = exchange_for(code)
-                if source_id == "eastmoney-stock-list" and not missing_exchange.get(exchange):
-                    continue
-                if re.fullmatch(r"\d{6}", code) and name and code not in seen:
-                    seen.add(code)
-                    output.append(
-                        {
-                            "code": code,
-                            "name": name,
-                            "exchange": exchange,
-                            "market": market_label(code),
-                            "source_id": source_id,
-                        }
-                    )
-        return output
+        if not set(MASTER_OFFICIAL_SOURCE.values()) <= successful_sources:
+            secondary_loaders = (
+                (lambda: frame_records(ak.stock_zh_a_spot_em()), "eastmoney-stock-list"),
+                (lambda: frame_records(ak.stock_zh_a_spot()), "sina-stock-list"),
+            )
+            with ThreadPoolExecutor(max_workers=len(secondary_loaders)) as pool:
+                future_sources = {pool.submit(loader): source_id for loader, source_id in secondary_loaders}
+                for future in as_completed(future_sources):
+                    try:
+                        rows = future.result()
+                        if rows:
+                            source_id = future_sources[future]
+                            batches.append((rows, source_id))
+                            successful_sources.add(source_id)
+                    except Exception:
+                        continue
+        if not batches:
+            if stale:
+                return stale
+            raise RuntimeError("沪深北官方与备用股票代码表均不可用")
 
-    return cached("stock_master", 24 * 3600, load, refresh)
+        official_sources = successful_sources.intersection(MASTER_OFFICIAL_SOURCE.values())
+        merged = merge_stock_master_batches(batches, official_sources, stale)
+        if not merged:
+            if stale:
+                return stale
+            raise RuntimeError("股票代码表响应为空")
+
+        meta = {
+            "refreshed_at": now_iso(),
+            "official_sources": sorted(official_sources),
+            "secondary_sources": sorted(
+                successful_sources.intersection({"eastmoney-stock-list", "sina-stock-list"})
+            ),
+            "stale_fallback_exchanges": sorted(
+                exchange
+                for exchange, source_id in MASTER_OFFICIAL_SOURCE.items()
+                if source_id not in official_sources
+            ),
+        }
+        _write_json_atomic(cache_file("stock_master"), merged)
+        _write_json_atomic(cache_file("stock_master_meta"), meta)
+        return merged
+
+
+def stock_master(refresh: bool = False) -> list[dict[str, str]]:
+    path = cache_file("stock_master")
+    stale = _read_stock_master_cache()
+    is_fresh = path.exists() and time.time() - path.stat().st_mtime < STOCK_MASTER_TTL
+    if stale and is_fresh and not refresh:
+        return stale
+    if stale and not refresh:
+        if not STOCK_MASTER_REFRESH_LOCK.locked():
+            Thread(target=_refresh_stock_master, args=(stale,), daemon=True).start()
+        return stale
+    return _refresh_stock_master(stale)
+
+
+def normalize_cninfo_companies(
+    payload: Any,
+    current_codes: set[str],
+) -> list[dict[str, str]]:
+    if isinstance(payload, dict):
+        rows = payload.get("stockList") or payload.get("data") or []
+    else:
+        rows = payload
+    output: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in rows if isinstance(rows, list) else []:
+        code = str(row.get("code") or row.get("证券代码") or "").strip().zfill(6)
+        name = str(row.get("zwjc") or row.get("简称") or row.get("name") or "").strip()
+        security_type = str(row.get("category") or row.get("证券类别") or "").strip()
+        if (
+            code in seen
+            or not re.fullmatch(r"\d{6}", code)
+            or not name
+            or security_type not in {"A股", "B股", "CDR"}
+        ):
+            continue
+        seen.add(code)
+        output.append(
+            {
+                "code": code,
+                "name": name,
+                "exchange": exchange_for(code),
+                "market": market_label(code),
+                "source_id": "cninfo-company-list",
+                "security_type": security_type,
+                "listing_status": "current" if code in current_codes else "historical_or_other",
+            }
+        )
+    return output
+
+
+def extended_company_master(refresh: bool = False) -> list[dict[str, str]]:
+    current = stock_master(refresh=False)
+    current_codes = {item["code"] for item in current}
+
+    def load() -> list[dict[str, str]]:
+        response_value = requests.get(
+            "https://www.cninfo.com.cn/new/data/szse_stock.json",
+            headers={
+                "Referer": CNINFO_HOME,
+                "User-Agent": "Mozilla/5.0",
+            },
+            timeout=20,
+        )
+        response_value.raise_for_status()
+        return normalize_cninfo_companies(response_value.json(), current_codes)
+
+    historical = cached("cninfo_company_master", 24 * 3600, load, refresh)
+    for item in historical:
+        item["listing_status"] = (
+            "current" if item["code"] in current_codes else "historical_or_other"
+        )
+    by_code = {item["code"]: item for item in historical}
+    for item in current:
+        by_code[item["code"]] = {
+            **item,
+            "security_type": "A股",
+            "listing_status": "current",
+        }
+    return sorted(by_code.values(), key=lambda item: item["code"])
+
+
+def stock_master_audit(items: list[dict[str, str]]) -> dict[str, Any]:
+    codes = [item.get("code", "") for item in items]
+    counts = {
+        exchange: sum(item.get("exchange") == exchange for item in items)
+        for exchange in MASTER_OFFICIAL_SOURCE
+    }
+    source_counts = {
+        source_id: sum(item.get("source_id") == source_id for item in items)
+        for source_id in MASTER_SOURCES
+    }
+    invalid_codes = sorted({code for code in codes if not re.fullmatch(r"\d{6}", code)})
+    duplicate_count = len(codes) - len(set(codes))
+    meta_path = cache_file("stock_master_meta")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    if not meta:
+        master_path = cache_file("stock_master")
+        meta = {
+            "refreshed_at": (
+                datetime.fromtimestamp(master_path.stat().st_mtime, TZ).isoformat(timespec="seconds")
+                if master_path.exists()
+                else None
+            ),
+            "official_sources": sorted(
+                source_id
+                for source_id in MASTER_OFFICIAL_SOURCE.values()
+                if source_counts[source_id]
+            ),
+            "secondary_sources": sorted(
+                source_id
+                for source_id in ("eastmoney-stock-list", "sina-stock-list")
+                if source_counts[source_id]
+            ),
+            "metadata_inferred_from_rows": True,
+        }
+    return {
+        "total": len(items),
+        "exchange_counts": counts,
+        "source_counts": source_counts,
+        "duplicate_count": duplicate_count,
+        "invalid_codes": invalid_codes,
+        "all_exchanges_present": all(counts.values()),
+        "integrity_ok": duplicate_count == 0 and not invalid_codes and all(counts.values()),
+        "refresh": meta,
+    }
 
 
 def lookup_company(code: str, refresh: bool = False) -> dict[str, str]:
     company = next((item for item in stock_master(refresh) if item["code"] == code), None)
     if not company:
-        raise ValueError(f"未在当前沪深北 A 股代码表中找到 {code}")
+        company = next(
+            (item for item in extended_company_master(refresh) if item["code"] == code),
+            None,
+        )
+    if not company:
+        raise ValueError(f"未在当前 A 股或巨潮历史公司列表中找到 {code}")
     return company
 
 
@@ -281,20 +593,9 @@ def parse_date(value: Any) -> str | None:
 
 
 def latest_report_source(code: str, refresh: bool = False) -> dict[str, Any] | None:
-    end = date.today().strftime("%Y%m%d")
-    start = (date.today() - timedelta(days=500)).strftime("%Y%m%d")
-
-    def load() -> list[dict[str, Any]]:
-        return frame_records(
-            ak.stock_zh_a_disclosure_report_cninfo(
-                symbol=code,
-                market="沪深京",
-                start_date=start,
-                end_date=end,
-            )
-        )
-
-    records = cached(f"reports_{code}", 24 * 3600, load, refresh)
+    records = filings_since(
+        filing_index(code, refresh), (date.today() - timedelta(days=500)).isoformat()
+    )
     records = [
         row
         for row in records
@@ -319,12 +620,16 @@ def latest_report_source(code: str, refresh: bool = False) -> dict[str, Any] | N
     )
 
 
-def profile_data(code: str, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+def profile_records(code: str, refresh: bool = False) -> list[dict[str, Any]]:
     def load() -> list[dict[str, Any]]:
         with CNINFO_JS_LOCK:
             return frame_records(ak.stock_profile_cninfo(symbol=code))
 
-    records = cached(f"profile_{code}", 12 * 3600, load, refresh)
+    return cached(f"profile_{code}", 12 * 3600, load, refresh)
+
+
+def profile_data(code: str, refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+    records = profile_records(code, refresh)
     if not records:
         return {}, source(f"cninfo-profile-{code}", "巨潮资讯", f"{code} 公司概况", CNINFO_HOME)
     row = records[0]
@@ -376,6 +681,128 @@ def profile_data_structured(code: str, refresh: bool = False) -> tuple[dict[str,
     return {key: value for key, value in data.items() if value}, src
 
 
+def discover_company_icon(website: str) -> str:
+    base_url = website.strip()
+    if not re.match(r"^https?://", base_url, re.IGNORECASE):
+        base_url = f"https://{base_url}"
+    if not re.match(r"^https?://", base_url, re.IGNORECASE):
+        raise ValueError("公司官网地址无效")
+    homepage = requests.get(
+        base_url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    homepage.raise_for_status()
+    for tag in re.findall(r"<link\b[^>]*>", homepage.text, flags=re.IGNORECASE):
+        rel_match = re.search(r"\brel\s*=\s*['\"]([^'\"]+)['\"]", tag, flags=re.IGNORECASE)
+        href_match = re.search(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", tag, flags=re.IGNORECASE)
+        if rel_match and href_match and "icon" in rel_match.group(1).lower():
+            return urljoin(homepage.url, href_match.group(1))
+    raise ValueError("公司官网未声明站点图标")
+
+
+@app.get("/api/company/{raw_code}/logo", response_class=RedirectResponse)
+def company_logo(raw_code: str, refresh: bool = False) -> RedirectResponse:
+    code = normalize_code(raw_code)
+    lookup_company(code)
+    profile, _ = profile_data(code, refresh=False)
+    website = profile.get("website", {}).get("value")
+    if not website:
+        raise ValueError("公司概况未披露官方网站")
+    logo_url = cached(
+        f"company_logo_{code}",
+        24 * 3600,
+        lambda: discover_company_icon(str(website)),
+        refresh,
+    )
+    return RedirectResponse(str(logo_url), status_code=307)
+
+
+def number_or_none(value: Any, multiplier: float = 1) -> float | None:
+    try:
+        return float(value) * multiplier if value not in (None, "", "-") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def tencent_quote(code: str) -> dict[str, Any]:
+    symbol = market_symbol(code, lower=True)
+    response_value = requests.get(
+        "https://qt.gtimg.cn/q=" + symbol,
+        headers={
+            "Referer": "https://stockapp.finance.qq.com/",
+            "User-Agent": "Mozilla/5.0",
+        },
+        timeout=10,
+    )
+    response_value.raise_for_status()
+    response_value.encoding = "gbk"
+    match = re.search(r'="(.*)"', response_value.text)
+    values = match.group(1).split("~") if match else []
+    if len(values) < 47 or not values[3]:
+        raise ValueError("腾讯行情响应缺少单股字段")
+    raw_time = values[30]
+    quote_time = (
+        f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]} {raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
+        if re.fullmatch(r"\d{14}", raw_time)
+        else raw_time
+    )
+    return {
+        "name": values[1],
+        "code": values[2],
+        "latest": number_or_none(values[3]),
+        "previous_close": number_or_none(values[4]),
+        "open": number_or_none(values[5]),
+        "volume_lots": number_or_none(values[36]),
+        "amount": number_or_none(values[37], 10000),
+        "change": number_or_none(values[31]),
+        "change_percent": number_or_none(values[32]),
+        "high": number_or_none(values[33]),
+        "low": number_or_none(values[34]),
+        "turnover_rate": number_or_none(values[38]),
+        "pe_ratio": number_or_none(values[39]),
+        "market_cap": number_or_none(values[44], 1e8),
+        "float_market_cap": number_or_none(values[45], 1e8),
+        "pb_ratio": number_or_none(values[46]),
+        "quote_time": quote_time,
+    }
+
+
+@app.get("/api/company/{raw_code}/quote")
+def company_quote(
+    raw_code: str,
+    refresh: bool = False,
+    mode: SourceMode = "official",
+) -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+        if mode == "strict":
+            return response(
+                {},
+                [],
+                ["仅官方来源模式不展示二手实时行情。"],
+                status="empty",
+            )
+        source_id = f"tencent-quote-{code}"
+        values = cached(f"quote_{code}", 30, lambda: tencent_quote(code), refresh)
+        data = {
+            key: field(value, source_id)
+            for key, value in values.items()
+            if key not in {"name", "code"} and value not in (None, "")
+        }
+        src = source(
+            source_id,
+            "腾讯证券",
+            f"{code} 实时行情",
+            f"https://gu.qq.com/{market_symbol(code, lower=True)}",
+            tier="secondary",
+        )
+        return response(data, [src], [])
+    except Exception as exc:
+        return response({}, [], [f"实时行情获取失败：{type(exc).__name__}: {exc}"], status="error")
+
+
 def _em_company_type(symbol: str) -> str:
     url = "https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/Index"
     html = requests.get(url, params={"type": "web", "code": symbol.lower()}, timeout=45).text
@@ -400,9 +827,9 @@ def _em_statement_rows(code: str, statement: str) -> list[dict[str, Any]]:
     if not dates:
         return []
     latest = dates[0]
-    wanted = [latest]
+    wanted = dates[:4]
     previous = f"{int(latest[:4]) - 1}{latest[4:]}"
-    if previous in dates:
+    if previous in dates and previous not in wanted:
         wanted.append(previous)
     for item in dates:
         if item.endswith("-12-31") and item not in wanted:
@@ -428,10 +855,10 @@ def financial_frames(code: str, refresh: bool = False) -> tuple[list[dict[str, A
     def balance() -> list[dict[str, Any]]:
         return _em_statement_rows(code, "balance")
 
-    return (
-        cached(f"profit_{code}", 12 * 3600, profit, refresh),
-        cached(f"balance_{code}", 12 * 3600, balance, refresh),
-    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        profit_future = pool.submit(cached, f"profit_{code}_q4", 12 * 3600, profit, refresh)
+        balance_future = pool.submit(cached, f"balance_{code}_q4", 12 * 3600, balance, refresh)
+        return profit_future.result(), balance_future.result()
 
 
 def report_period(row: dict[str, Any]) -> str | None:
@@ -605,8 +1032,8 @@ def business_segments(code: str, refresh: bool = False) -> tuple[list[dict[str, 
                 "category_type": first_value(row, ("分类类型", "分类方向")),
                 "name": name,
                 "revenue": revenue,
-                "revenue_share_percent": first_value(row, ("收入比例", "主营收入占比")),
-                "gross_margin_percent": first_value(row, ("毛利率",)),
+                "revenue_share_percent": number_or_none(first_value(row, ("收入比例", "主营收入占比")), 100),
+                "gross_margin_percent": number_or_none(first_value(row, ("毛利率",)), 100),
                 "period": period,
                 "source_id": src["source_id"],
             }
@@ -655,10 +1082,10 @@ def shareholder_data(
                 {
                     "period": period,
                     "name": first_value(row, ("股东名称", "HOLDER_NAME")),
-                    "shares": first_value(row, ("持股数量", "HOLD_NUM")),
+                    "shares": first_value(row, ("持股数量", "持股数", "HOLD_NUM")),
                     "ratio_percent": first_value(row, ("占总股本持股比例", "持股比例", "HOLD_RATIO")),
                     "change": first_value(row, ("持股变动", "增减", "HOLD_NUM_CHANGE")),
-                    "holder_type": first_value(row, ("股东性质", "HOLDER_TYPE")),
+                    "holder_type": first_value(row, ("股东性质", "股份类型", "HOLDER_TYPE")),
                     "source_id": src["source_id"],
                 }
             )
@@ -675,7 +1102,7 @@ def market_brief(refresh: bool = False) -> dict[str, Any]:
         return frame_records(ak.stock_info_global_em())
 
     try:
-        records = cached("market_headlines", 10 * 60, load, refresh)
+        records = cached("market_headlines", 6 * 3600, load, refresh)
     except Exception as exc:
         return response(
             {"headlines": []},
@@ -720,10 +1147,183 @@ def market_brief(refresh: bool = False) -> dict[str, Any]:
     )
 
 
-@app.get("/api/search")
-def search(q: str = Query(min_length=1), refresh: bool = False) -> dict[str, Any]:
+def sector_source(
+    kind: Literal["industry", "concept"],
+    provider: Literal["eastmoney", "sina"],
+    suffix: str = "",
+) -> dict[str, Any]:
+    label = "行业板块" if kind == "industry" else "概念板块"
+    if provider == "sina":
+        return source(
+            f"sina-sector-{kind}{suffix}",
+            "新浪财经",
+            f"A股{label}实时行情",
+            "https://finance.sina.com.cn/stock/sl/",
+            tier="secondary",
+        )
+    return source(
+        f"eastmoney-sector-{kind}{suffix}",
+        "东方财富",
+        f"A股{label}实时行情",
+        f"https://quote.eastmoney.com/center/boardlist.html#{kind}_board",
+        tier="secondary",
+    )
+
+
+@app.get("/api/sectors")
+def sectors(
+    kind: Literal["industry", "concept"] = "industry",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    eastmoney_loader = ak.stock_board_industry_name_em if kind == "industry" else ak.stock_board_concept_name_em
+
+    def load() -> list[dict[str, Any]]:
+        indicator = "新浪行业" if kind == "industry" else "概念"
+        try:
+            rows = frame_records(ak.stock_sector_spot(indicator=indicator))
+            if rows:
+                return [{**row, "_provider": "sina"} for row in rows]
+        except Exception:
+            pass
+        return [
+            {**row, "_provider": "eastmoney"}
+            for row in frame_records(eastmoney_loader())
+        ]
+
     try:
-        items = stock_master(refresh)
+        records = cached(
+            f"sector_boards_{kind}",
+            5 * 60,
+            load,
+            refresh,
+        )
+    except Exception as exc:
+        return response(
+            {"kind": kind, "boards": []},
+            [],
+            [f"板块行情获取失败：{type(exc).__name__}: {exc}"],
+            status="error",
+        )
+
+    provider: Literal["eastmoney", "sina"] = (
+        "sina" if records and records[0].get("_provider") == "sina" else "eastmoney"
+    )
+    src = sector_source(kind, provider)
+    boards: list[dict[str, Any]] = []
+    for row in records:
+        name = first_value(row, ("板块名称", "名称", "板块"))
+        if not name:
+            continue
+        boards.append(
+            {
+                "name": name,
+                "code": first_value(row, ("板块代码", "代码", "label")),
+                "latest": first_value(row, ("最新价", "平均价格")),
+                "change_percent": first_value(row, ("涨跌幅",)),
+                "turnover_rate": first_value(row, ("换手率",)),
+                "turnover_amount": first_value(row, ("成交额", "总成交额")),
+                "market_cap": first_value(row, ("总市值",)),
+                "advancers": first_value(row, ("上涨家数",)),
+                "decliners": first_value(row, ("下跌家数",)),
+                "leader": first_value(row, ("领涨股票", "股票名称")),
+                "leader_change_percent": first_value(
+                    row,
+                    ("领涨股票-涨跌幅", "领涨股票涨跌幅", "个股-涨跌幅"),
+                ),
+                "source_id": src["source_id"],
+            }
+        )
+    return response(
+        {"kind": kind, "boards": boards},
+        [src] if boards else [],
+        [] if boards else ["当前未取得板块行情。"],
+        status=None if boards else "empty",
+    )
+
+
+@app.get("/api/sectors/{kind}/{board_name}")
+def sector_members(
+    kind: Literal["industry", "concept"],
+    board_name: str,
+    board_code: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    eastmoney_loader = ak.stock_board_industry_cons_em if kind == "industry" else ak.stock_board_concept_cons_em
+
+    def load() -> list[dict[str, Any]]:
+        if board_code and not board_code.startswith("BK"):
+            try:
+                rows = frame_records(ak.stock_sector_detail(sector=board_code))
+                if rows:
+                    return [{**row, "_provider": "sina"} for row in rows]
+            except Exception:
+                pass
+        try:
+            rows = frame_records(eastmoney_loader(symbol=board_name))
+            if rows:
+                return [{**row, "_provider": "eastmoney"} for row in rows]
+        except Exception:
+            pass
+        return []
+
+    try:
+        records = cached(
+            f"sector_members_{kind}_{board_name}_{board_code or ''}",
+            5 * 60,
+            load,
+            refresh,
+        )
+    except Exception as exc:
+        return response(
+            {"kind": kind, "name": board_name, "companies": []},
+            [],
+            [f"{board_name}成份行情获取失败：{type(exc).__name__}: {exc}"],
+            status="error",
+        )
+
+    safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", board_name)
+    provider: Literal["eastmoney", "sina"] = (
+        "sina" if records and records[0].get("_provider") == "sina" else "eastmoney"
+    )
+    src = sector_source(kind, provider, f"-{safe_name}")
+    companies: list[dict[str, Any]] = []
+    for row in records:
+        code = first_value(row, ("代码", "证券代码", "code"))
+        name = first_value(row, ("名称", "证券简称", "name"))
+        if not code or not name:
+            continue
+        market_cap = first_value(row, ("总市值", "mktcap"))
+        if provider == "sina" and market_cap is not None:
+            market_cap = float(market_cap) * 10000
+        companies.append(
+            {
+                "code": str(code).zfill(6),
+                "name": name,
+                "latest": first_value(row, ("最新价", "trade")),
+                "change_percent": first_value(row, ("涨跌幅", "changepercent")),
+                "turnover_rate": first_value(row, ("换手率", "turnoverratio")),
+                "amount": first_value(row, ("成交额", "amount")),
+                "market_cap": market_cap,
+                "pe_ratio": first_value(row, ("市盈率-动态", "市盈率", "per")),
+                "source_id": src["source_id"],
+            }
+        )
+    return response(
+        {"kind": kind, "name": board_name, "companies": companies},
+        [src] if companies else [],
+        [] if companies else [f"当前未取得{board_name}成份行情。"],
+        status=None if companies else "empty",
+    )
+
+
+@app.get("/api/search")
+def search(
+    q: str = Query(min_length=1),
+    scope: SearchScope = "current",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        items = extended_company_master(refresh) if scope == "extended" else stock_master(refresh)
         keyword = q.strip().lower()
         exact = [item for item in items if keyword in (item["code"].lower(), item["name"].lower())]
         fuzzy = [
@@ -737,7 +1337,11 @@ def search(q: str = Query(min_length=1), refresh: bool = False) -> dict[str, Any
         return response(
             results,
             sources,
-            [] if results else ["没有匹配的当前上市 A 股。"],
+            [] if results else [
+                "没有匹配的当前上市 A 股。"
+                if scope == "current"
+                else "没有匹配的当前或历史上市公司、B 股或 CDR。"
+            ],
             status=None if results else "empty",
         )
     except Exception as exc:
@@ -764,64 +1368,54 @@ def overview(raw_code: str, refresh: bool = False, mode: SourceMode = "official"
     financial: dict[str, Any] = {}
     segments: list[dict[str, Any]] = []
     shareholders: list[dict[str, Any]] = []
-    try:
-        if mode == "structured":
-            profile, profile_src = profile_data_structured(code, refresh)
+    periods = [
+        f"{year}-{suffix}"
+        for year in range(date.today().year, date.today().year - 3, -1)
+        for suffix in ("12-31", "09-30", "06-30", "03-31")
+        if f"{year}-{suffix}" <= date.today().isoformat()
+    ]
+
+    def load_profile():
+        return profile_data_structured(code, refresh) if mode == "structured" else profile_data(code, refresh)
+
+    def load_financial():
+        return financial_data(code, refresh, mode == "official")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        profile_future = pool.submit(load_profile)
+        financial_future = pool.submit(load_financial) if mode != "strict" else None
+        segments_future = pool.submit(business_segments, code, refresh) if mode != "strict" else None
+        shareholders_future = pool.submit(shareholder_data, code, periods, refresh) if mode != "strict" else None
+
+        try:
+            profile, profile_src = profile_future.result()
+            sources.append(profile_src)
+        except Exception as exc:
+            warnings.append(f"公司概况获取失败：{type(exc).__name__}: {exc}")
+
+        if mode == "strict":
+            warnings.append("仅官方来源模式未展示缺少官方结构化接口的财务、主营构成和股东数值。")
         else:
-            profile, profile_src = profile_data(code, refresh)
-        sources.append(profile_src)
-    except Exception as exc:
-        warnings.append(f"公司概况获取失败：{type(exc).__name__}: {exc}")
-    if mode != "strict":
-        try:
-            if mode == "official":
-                financial, financial_sources, financial_warnings = financial_data(code, refresh)
-            else:
-                financial, financial_sources, financial_warnings = financial_data(
-                    code,
-                    refresh,
-                    link_official_report=False,
-                )
-            sources.extend(financial_sources)
-            warnings.extend(financial_warnings)
-        except Exception as exc:
-            warnings.append(f"财务数据获取失败：{type(exc).__name__}: {exc}")
-        try:
-            segments, segment_src = business_segments(code, refresh)
-            if segment_src:
-                sources.append(segment_src)
-            else:
-                warnings.append("未取得最近年报或半年报主营构成。")
-        except Exception as exc:
-            warnings.append(f"主营构成获取失败：{type(exc).__name__}: {exc}")
-    else:
-        warnings.append("仅官方来源模式未展示缺少官方结构化接口的财务、主营构成和股东数值。")
-    if mode != "strict":
-        try:
-            periods = [item["period"] for item in financial.get("annual_metrics", [])]
-            latest = financial.get("period")
-            if latest:
-                periods.insert(0, latest)
-                try:
-                    year = int(latest[:4])
-                    for suffix in ("09-30", "06-30", "03-31", "12-31"):
-                        candidate = f"{year}-{suffix}"
-                        if candidate <= latest and candidate not in periods:
-                            periods.append(candidate)
-                    periods.append(f"{year - 1}-12-31")
-                except ValueError:
-                    pass
-            cursor_year = date.today().year
-            for year in range(cursor_year, cursor_year - 3, -1):
-                for suffix in ("12-31", "09-30", "06-30", "03-31"):
-                    candidate = f"{year}-{suffix}"
-                    if candidate <= date.today().isoformat() and candidate not in periods:
-                        periods.append(candidate)
-            shareholders, shareholder_sources, shareholder_warnings = shareholder_data(code, periods, refresh)
-            sources.extend(shareholder_sources)
-            warnings.extend(shareholder_warnings)
-        except Exception as exc:
-            warnings.append(f"股东数据获取失败：{type(exc).__name__}: {exc}")
+            try:
+                financial, financial_sources, financial_warnings = financial_future.result()
+                sources.extend(financial_sources)
+                warnings.extend(financial_warnings)
+            except Exception as exc:
+                warnings.append(f"财务数据获取失败：{type(exc).__name__}: {exc}")
+            try:
+                segments, segment_src = segments_future.result()
+                if segment_src:
+                    sources.append(segment_src)
+                else:
+                    warnings.append("未取得最近年报或半年报主营构成。")
+            except Exception as exc:
+                warnings.append(f"主营构成获取失败：{type(exc).__name__}: {exc}")
+            try:
+                shareholders, shareholder_sources, shareholder_warnings = shareholders_future.result()
+                sources.extend(shareholder_sources)
+                warnings.extend(shareholder_warnings)
+            except Exception as exc:
+                warnings.append(f"股东数据获取失败：{type(exc).__name__}: {exc}")
 
     identity_src = master_src["source_id"]
     identity = {}
@@ -915,7 +1509,7 @@ def capital(
         ]
         return day, rows
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(fetch, day): day for day in candidates}
         for future in as_completed(futures):
             day = futures[future]
@@ -988,25 +1582,10 @@ def contracts(
         return response([], [], [str(exc)], status="error")
     end = date.today()
     start = end - timedelta(days=round(months * 30.44))
-
-    def load() -> list[dict[str, Any]]:
-        return frame_records(
-            ak.stock_zh_a_disclosure_report_cninfo(
-                symbol=code,
-                market="沪深京",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
-            )
-        )
-
     try:
-        records = cached(f"announcements_{code}_{months}", 24 * 3600, load, refresh)
+        records = filings_since(filing_index(code, refresh), start.isoformat())
     except Exception as exc:
         return response([], [], [f"巨潮公告查询失败：{type(exc).__name__}: {exc}"], status="error")
-    records.sort(
-        key=lambda row: parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime"))) or "",
-        reverse=True,
-    )
     matches = []
     sources = []
     for index, row in enumerate(records):
@@ -1024,12 +1603,26 @@ def contracts(
             "url": url,
             "source_id": source_id,
         }
-        if mode != "structured":
-            try:
-                item.update(extract_contract_fields(url))
-            except Exception:
-                pass
         matches.append(item)
+    if mode != "structured" and matches:
+        def contract_fields(index: int, item: dict[str, Any]) -> tuple[int, dict[str, str]]:
+            cache_key = f"contract_fields_{code}_{item.get('published_at') or index}_{index}"
+            fields = cached(
+                cache_key,
+                30 * 24 * 3600,
+                lambda: extract_contract_fields(str(item["url"])),
+                refresh,
+            )
+            return index, fields
+
+        with ThreadPoolExecutor(max_workers=min(4, len(matches))) as pool:
+            futures = [pool.submit(contract_fields, index, item) for index, item in enumerate(matches)]
+            for future in as_completed(futures):
+                try:
+                    index, extracted = future.result()
+                    matches[index].update(extracted)
+                except Exception:
+                    continue
     warnings = [] if matches else [f"最近 {months} 个月未检索到标题含合同、中标、订单、框架协议或重大项目的公告。"]
     if not sources:
         sources.append(
@@ -1189,14 +1782,1465 @@ def peers(raw_code: str, refresh: bool = False, mode: SourceMode = "official") -
         )
 
 
+def em_f10(module: str, page: str, params: dict[str, Any]) -> dict[str, Any]:
+    value = requests.get(f"{EASTMONEY_F10}/{module}/{page}", params=params, headers=BROWSER_HEADERS, timeout=30)
+    value.raise_for_status()
+    return value.json()
+
+
+def em_datacenter(report_name: str, columns: str, filters: str, sort: str, page_size: int = 50) -> list[dict[str, Any]]:
+    value = requests.get(
+        EASTMONEY_DATACENTER,
+        params={
+            "reportName": report_name,
+            "columns": columns,
+            "filter": filters,
+            "sortColumns": sort,
+            "sortTypes": "-1",
+            "pageSize": str(page_size),
+            "pageNumber": "1",
+            "source": "WEB",
+            "client": "WEB",
+        },
+        headers=BROWSER_HEADERS,
+        timeout=30,
+    )
+    value.raise_for_status()
+    result = value.json().get("result") or {}
+    return [
+        {str(key): clean_scalar(item) for key, item in row.items()}
+        for row in (result.get("data") or [])
+    ]
+
+
+def ths_page(code: str, page: str, refresh: bool = False) -> str:
+    def load() -> str:
+        value = requests.get(f"{THS_F10}/{code}/{page}.html", headers=BROWSER_HEADERS, timeout=30)
+        value.raise_for_status()
+        value.encoding = "gbk"
+        return value.text
+
+    return cached(f"ths_{page}_{code}", 12 * 3600, load, refresh)
+
+
+def strip_tags(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+
+
+THS_PARTNER_ROW = re.compile(
+    r'<div class="clientname">([^<]*)</div>\s*</td>\s*<td class="tc">([^<]*)</td>\s*<td class="tc">([^<]*)</td>'
+)
+THS_PERSON_INTRO = re.compile(
+    r'class="title">\s*<h3>\s*([^<]+?)\s*</h3>.*?class="mainintro">\s*<div>\s*<p>(.*?)</p>',
+    re.S,
+)
+CONTROL_LABELS = (
+    ("控股股东", "controlling_shareholder"),
+    ("实际控制人", "actual_controller"),
+    ("最终控制人", "ultimate_controller"),
+)
+
+
+def ths_partners(html: str) -> dict[str, Any]:
+    start = html.find('id="provider"')
+    if start < 0:
+        return {}
+    section = html[start:]
+    period = re.search(r'class="operateTab"[^>]*>(\d{4}-\d{2}-\d{2})<', section)
+    result: dict[str, Any] = {"period": period.group(1) if period else None}
+    for label, key, total_pattern in (
+        ("客户名称", "customers", r"前5大客户：共销售了<i>([^<]*)</i>元,占([^<]*)的<i>([^<]*)</i>"),
+        ("供应商名称", "suppliers", r"前5大供应商：共采购了<i>([^<]*)</i>元,占([^<]*)的<i>([^<]*)</i>"),
+    ):
+        index = section.find(label)
+        rows = (
+            THS_PARTNER_ROW.findall(section[index : section.find("</table>", index)])
+            if index >= 0
+            else []
+        )
+        result[key] = [
+            {"name": name.strip(), "amount_text": amount.strip(), "share_text": share.strip()}
+            for name, amount, share in rows
+        ]
+        total = re.search(total_pattern, section)
+        if total:
+            result[f"{key}_total"] = {
+                "amount_text": total.group(1),
+                "denominator": total.group(2),
+                "share_text": total.group(3),
+            }
+    return result
+
+
+def ths_control_chain(html: str) -> dict[str, Any]:
+    people = {name: strip_tags(intro) for name, intro in THS_PERSON_INTRO.findall(html)}
+    chain: dict[str, Any] = {}
+    for label, key in CONTROL_LABELS:
+        match = re.search(rf">{label}：</strong>(.*?)</div>", html, re.S)
+        if not match:
+            continue
+        text = strip_tags(match.group(1))
+        name = re.split(r"[（(]", text)[0].strip()
+        if not name:
+            continue
+        ratio = re.search(r"比例：([\d.]+)\s*%", text)
+        item: dict[str, Any] = {"name": name}
+        if ratio:
+            item["ratio_percent"] = float(ratio.group(1))
+        if name in people:
+            item["resume"] = people[name]
+        chain[key] = item
+    return chain
+
+
+CNINFO_PDF = "http://static.cninfo.com.cn/finalpage/{day}/{announcement_id}.PDF"
+FILING_NOISE = (
+    re.compile(r"\S{2,25}\s*20\d{2}\s*年(年度|半年度)报告(全文)?\s*\d{0,4}"),
+    re.compile(r"\S{2,40}(募集说明书|招股说明书)(（[^）]{0,12}）)?\s*[\d\-]{0,10}"),
+)
+PARTNER_TABLE_ROW = re.compile(r"(\d{1,2})\s+(.{1,40}?)\s+([\d,]+\.\d{2})\s+([\d.]+)\s*%")
+PARTNER_STARTS = (
+    "公司主要销售客户情况",
+    "主要销售客户及主要供应商情况",
+    "前五名客户合计销售金额",
+    "前五名客户销售额",
+    "前五名客户",
+)
+PARTNER_STOPS = ("2.2.2.2", "3、费用", "报告期内公司贸易业务", "费用 单位", "研发投入")
+AMOUNT_UNITS = {"元": 1, "万元": 10**4, "百万元": 10**6, "亿元": 10**8}
+
+
+def partner_totals(text: str, label: str) -> dict[str, Any]:
+    match = re.search(
+        rf"前五(?:名|大){label}([^%。；]{{0,32}}?)([\d][\d,]*\.?\d*)\s*(亿元|百万元|万元|元|)",
+        text,
+    )
+    if not match:
+        return {}
+    unit = match.group(3) or ("元" if "（元）" in match.group(1) else "")
+    result: dict[str, Any] = {"amount_text": f"{match.group(2)}{unit}"}
+    if unit in AMOUNT_UNITS:
+        result["amount"] = clean_scalar(float(match.group(2).replace(",", "")) * AMOUNT_UNITS[unit])
+    share = re.search(r"([\d.]+)\s*%", text[match.end() : match.end() + 90])
+    if share:
+        result["share_percent"] = float(share.group(1))
+    return result
+
+
+def parse_partner_section(section_text: str | None) -> dict[str, Any]:
+    if not section_text:
+        return {}
+    result: dict[str, Any] = {}
+    for key, label, row_label in (("customers", "客户", "客户名称"), ("suppliers", "供应商", "供应商名称")):
+        totals = partner_totals(section_text, label)
+        header = section_text.find(row_label)
+        rows: list[dict[str, Any]] = []
+        if header >= 0:
+            body = section_text[header:]
+            body = body[: body.find("合计")] if "合计" in body else body
+            for rank, name, amount, share in PARTNER_TABLE_ROW.findall(body):
+                if int(rank) != len(rows) + 1:
+                    continue
+                rows.append(
+                    {
+                        "rank": int(rank),
+                        "name": re.sub(r"\s+", "", name),
+                        "amount": float(amount.replace(",", "")),
+                        "share_percent": float(share),
+                    }
+                )
+        if totals or rows:
+            result[key] = {**totals, "rows": rows}
+    related = re.search(r"关联方[^%]{0,24}?([\d.]+)\s*%", section_text)
+    if related:
+        result["related_party_share_percent"] = float(related.group(1))
+    return result
+
+
+def disclosure_records(code: str, start: date) -> list[dict[str, Any]]:
+    with CNINFO_QUERY_LOCK:
+        return frame_records(
+            ak.stock_zh_a_disclosure_report_cninfo(
+                symbol=code,
+                market="沪深京",
+                start_date=start.strftime("%Y%m%d"),
+                end_date=date.today().strftime("%Y%m%d"),
+            )
+        )
+
+
+FILING_INDEX_DAYS = 1830
+
+
+def filing_index(code: str, refresh: bool = False) -> list[dict[str, Any]]:
+    start = date.today() - timedelta(days=FILING_INDEX_DAYS)
+    return cached(f"filings_{code}", 12 * 3600, lambda: disclosure_records(code, start), refresh)
+
+
+def filing_archive(code: str, refresh: bool = False) -> list[dict[str, Any]]:
+    start = date(date.today().year - 12, 1, 1)
+    return cached(
+        f"filing_archive_{code}", 30 * 24 * 3600, lambda: disclosure_records(code, start), refresh
+    )
+
+
+def filings_since(records: list[dict[str, Any]], start: str) -> list[dict[str, Any]]:
+    rows = [
+        {**row, "_published_at": parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime")))}
+        for row in records
+    ]
+    rows = [row for row in rows if row["_published_at"] and row["_published_at"] >= start]
+    rows.sort(key=lambda row: row["_published_at"], reverse=True)
+    return rows
+
+
+def latest_filing(
+    records: list[dict[str, Any]], pattern: str, exclude: str | None = None
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for row in records:
+        title = str(first_value(row, ("公告标题", "标题", "announcementTitle")) or "")
+        if not re.search(pattern, title) or (exclude and re.search(exclude, title)):
+            continue
+        detail = str(first_value(row, ("公告链接", "网址", "url")) or "")
+        published = parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime")))
+        announcement = re.search(r"announcementId=(\d+)", detail)
+        if not announcement or not published:
+            continue
+        candidates.append(
+            {
+                "title": title,
+                "published_at": published,
+                "url": detail,
+                "pdf_url": CNINFO_PDF.format(day=published, announcement_id=announcement.group(1)),
+            }
+        )
+    candidates.sort(key=lambda item: item["published_at"], reverse=True)
+    return candidates[0] if candidates else None
+
+
+def filing_text(cache_key: str, pdf_url: str, refresh: bool = False) -> str:
+    def load() -> str:
+        value = requests.get(pdf_url, headers=BROWSER_HEADERS, timeout=90)
+        value.raise_for_status()
+        reader = PdfReader(io.BytesIO(value.content))
+        text = re.sub(r"\s+", " ", "\n".join(page.extract_text() or "" for page in reader.pages))
+        for noise in FILING_NOISE:
+            text = noise.sub(" ", text)
+        return re.sub(r"\s+", " ", text)
+
+    return cached(cache_key, 30 * 24 * 3600, load, refresh)
+
+
+def report_section(
+    text: str,
+    starts: tuple[str, ...],
+    stops: tuple[str, ...],
+    limit: int = 3000,
+    signal: str | None = None,
+) -> str | None:
+    def window_at(index: int, start: str) -> str:
+        window = text[index : index + limit]
+        ends = [window.find(stop, len(start)) for stop in stops]
+        ends = [end for end in ends if end > 0]
+        return (window[: min(ends)] if ends else window).strip(" 　")
+
+    first: str | None = None
+    for start in starts:
+        for match in re.finditer(re.escape(start), text):
+            window = window_at(match.start(), start)
+            if first is None:
+                first = window
+            if signal is None or re.search(signal, window[:400]):
+                return window
+    return first
+
+
+def annual_report_facts(
+    code: str, records: list[dict[str, Any]], refresh: bool = False
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    filing = latest_filing(records, r"\d{4}年年度报告", r"摘要|英文|说明|问询|意见|审计|专项")
+    if not filing:
+        return {}, None
+    text = filing_text(f"filing_annual_{code}_{filing['published_at']}", filing["pdf_url"], refresh)
+    src = source(
+        f"cninfo-annual-{code}-{filing['published_at']}",
+        "巨潮资讯",
+        filing["title"],
+        filing["url"],
+        period=filing["published_at"],
+        published_at=filing["published_at"],
+    )
+    facts = {
+        "core_competence": report_section(
+            text, ("核心竞争力分析",), ("四、主营业务分析", "第四节", "四、公司未来发展")
+        ),
+        "industry_position": report_section(
+            text, ("公司所处行业情况", "报告期内公司所处行业情况"), ("二、主营业务分析", "三、核心竞争力")
+        ),
+        "controlling_shareholder": report_section(
+            text, ("控股股东情况",), ("公司实际控制人", "实际控制人及其一致行动人"), 1600
+        ),
+        "actual_controller": report_section(
+            text,
+            ("实际控制人及其一致行动人", "实际控制人情况", "公司实际控制人"),
+            ("公司控股股东或第一大股东", "四、股份回购", "其他持股在"),
+            1600,
+            signal=r"国籍|实际控制人性质|自然人|不存在实际控制人|无实际控制人",
+        ),
+    }
+    facts["partners"] = parse_partner_section(
+        report_section(text, PARTNER_STARTS, PARTNER_STOPS, 1800, signal=r"[\d.]+\s*%")
+    )
+    return {key: value for key, value in facts.items() if value}, src
+
+
+def competition_disclosure(
+    code: str, refresh: bool = False
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    records = filing_archive(code, refresh)
+    filing = latest_filing(
+        records,
+        r"(招股说明书|募集说明书)(（[^）]*）)?$",
+        r"摘要|确认意见|法律意见|核查意见|之|公告",
+    )
+    if not filing:
+        return {}, None
+    text = filing_text(f"filing_offering_{code}_{filing['published_at']}", filing["pdf_url"], refresh)
+    section_text = report_section(
+        text,
+        (
+            "行业竞争情况",
+            "行业竞争状况",
+            "行业竞争格局",
+            "行业主要参与者",
+            "主要竞争对手",
+            "同行业可比公司",
+            "竞争格局",
+            "市场竞争情况",
+        ),
+        ("三、公司主营业务", "（四）", "四、", "第二节"),
+        2600,
+        signal=r"主要参与者|竞争对手|主要厂商|主要企业|市场份额|龙头|可比公司",
+    )
+    if not section_text:
+        return {}, None
+    src = source(
+        f"cninfo-offering-{code}-{filing['published_at']}",
+        "巨潮资讯",
+        filing["title"],
+        filing["url"],
+        period=filing["published_at"],
+        published_at=filing["published_at"],
+    )
+    return (
+        {"text": section_text, "document": filing["title"], "published_at": filing["published_at"]},
+        src,
+    )
+
+
+@app.get("/api/company/{raw_code}/business")
+def business(raw_code: str, refresh: bool = False, mode: SourceMode = "official") -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+
+    sources: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    data: dict[str, Any] = {}
+    filing_pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        filings = filing_index(code, refresh)
+    except Exception as exc:
+        filings = []
+        warnings.append(f"巨潮公告索引获取失败：{type(exc).__name__}: {exc}")
+    annual_future = filing_pool.submit(annual_report_facts, code, filings, refresh)
+    competition_future = filing_pool.submit(competition_disclosure, code, refresh)
+
+    cninfo_src = source(f"cninfo-profile-{code}", "巨潮资讯", f"{code} 公司概况", CNINFO_HOME)
+    try:
+        records = profile_records(code, refresh)
+        row = records[0] if records else {}
+        scope = {
+            key: field(first_value(row, names), cninfo_src["source_id"])
+            for key, names in (
+                ("main_business", ("主营业务",)),
+                ("business_scope", ("经营范围",)),
+                ("organization_profile", ("机构简介",)),
+            )
+        }
+        data["scope"] = {key: value for key, value in scope.items() if value}
+        if data["scope"]:
+            sources.append(cninfo_src)
+        else:
+            warnings.append("巨潮公司概况未返回经营范围或机构简介。")
+    except Exception as exc:
+        warnings.append(f"经营范围获取失败：{type(exc).__name__}: {exc}")
+
+    try:
+        facts, annual_src = annual_future.result()
+        if annual_src and facts:
+            sources.append(annual_src)
+            data["annual_report"] = {**facts, "source_id": annual_src["source_id"], "title": annual_src["title"]}
+            partners = facts.get("partners") or {}
+            if not partners:
+                warnings.append("年报未定位到可解析的前五名客户与供应商披露。")
+            elif not any(partners.get(key, {}).get("rows") for key in ("customers", "suppliers")):
+                warnings.append("年报只披露前五名客户与供应商的合计金额和占比，未逐户列示。")
+        else:
+            warnings.append("未定位到可解析的最新年度报告原文。")
+    except Exception as exc:
+        warnings.append(f"年报原文抽取失败：{type(exc).__name__}: {exc}")
+    try:
+        competition, competition_src = competition_future.result()
+        if competition_src:
+            sources.append(competition_src)
+            data["competition"] = {**competition, "source_id": competition_src["source_id"]}
+        else:
+            warnings.append(
+                "招股说明书或募集说明书中未定位到行业竞争章节；本站不以推断方式生成境内外可比公司名单。"
+            )
+    except Exception as exc:
+        warnings.append(f"行业竞争章节抽取失败：{type(exc).__name__}: {exc}")
+    finally:
+        filing_pool.shutdown(wait=False)
+
+    if mode == "strict":
+        warnings.append("仅官方来源模式只展示巨潮公司概况与定期报告、发行文件原文，不展示同花顺与东方财富栏目。")
+        return response(data, sources, warnings, status="partial")
+
+    ths_products_src = source(
+        f"ths-products-{code}",
+        "同花顺",
+        f"{code} 主营介绍",
+        f"{THS_F10}/{code}/operate.html",
+        tier="secondary",
+    )
+    try:
+        rows = cached(
+            f"ths_products_{code}",
+            12 * 3600,
+            lambda: frame_records(ak.stock_zyjs_ths(symbol=code)),
+            refresh,
+        )
+        row = rows[0] if rows else {}
+        products = {
+            key: field(first_value(row, names), ths_products_src["source_id"])
+            for key, names in (
+                ("product_type", ("产品类型",)),
+                ("product_name", ("产品名称",)),
+                ("main_business", ("主营业务",)),
+            )
+        }
+        data["products"] = {key: value for key, value in products.items() if value}
+        if data["products"]:
+            sources.append(ths_products_src)
+    except Exception as exc:
+        warnings.append(f"主营产品获取失败：{type(exc).__name__}: {exc}")
+
+    company_src = source(
+        f"ths-company-{code}",
+        "同花顺",
+        f"{code} 公司资料与实际控制人",
+        f"{THS_F10}/{code}/company.html",
+        tier="secondary",
+    )
+    controller_src = source(
+        f"eastmoney-controller-{code}",
+        "东方财富",
+        f"{code} 实际控制人",
+        f"{EASTMONEY_F10}/ShareholderResearch/Index?type=web&code={market_symbol(code)}",
+        tier="secondary",
+    )
+    control: dict[str, Any] = {}
+    try:
+        control = ths_control_chain(ths_page(code, "company", refresh))
+        for item in control.values():
+            item["source_id"] = company_src["source_id"]
+        if control:
+            sources.append(company_src)
+    except Exception as exc:
+        warnings.append(f"控制关系获取失败：{type(exc).__name__}: {exc}")
+    try:
+        payload = shareholder_research(code, refresh)
+        controller_rows = payload.get("sjkzr") or []
+        if controller_rows and "actual_controller" not in control:
+            control["actual_controller"] = {
+                "name": controller_rows[0].get("HOLDER_NAME"),
+                "ratio_percent": clean_scalar(controller_rows[0].get("HOLD_RATIO")),
+                "source_id": controller_src["source_id"],
+            }
+            sources.append(controller_src)
+    except Exception as exc:
+        warnings.append(f"实际控制人交叉核对失败：{type(exc).__name__}: {exc}")
+    data["control"] = control
+    if not control:
+        warnings.append("未取得可核验的控股股东或实际控制人记录。")
+    if not (data.get("annual_report") or {}).get("actual_controller"):
+        warnings.append(
+            "年报未提供可解析的实际控制人章节；控制关系仅来自二手结构化栏目，请查阅年报“控股股东及实际控制人情况”。"
+        )
+
+    try:
+        partners = ths_partners(ths_page(code, "operate", refresh))
+        if partners.get("customers") or partners.get("suppliers"):
+            partner_src = source(
+                f"ths-partners-{code}",
+                "同花顺",
+                f"{code} 主要客户及供应商",
+                f"{THS_F10}/{code}/operate.html",
+                period=partners.get("period"),
+                tier="secondary",
+            )
+            sources.append(partner_src)
+            partners["source_id"] = partner_src["source_id"]
+            data["partners"] = partners
+        else:
+            warnings.append("同花顺未提供前五大客户与供应商集中度栏目。")
+    except Exception as exc:
+        warnings.append(f"客户与供应商获取失败：{type(exc).__name__}: {exc}")
+
+    filed = (data.get("annual_report") or {}).get("partners") or {}
+    disclosed = filed.get("customers", {}).get("rows", []) + filed.get("suppliers", {}).get("rows", [])
+    if disclosed and all(re.fullmatch(r"(客户|供应商|单位|公司)\d+", row["name"]) for row in disclosed):
+        warnings.append("年报以“客户1/供应商1”等匿名编号披露前五名交易对象，未公开具体企业名称。")
+    return response(data, sources, warnings)
+
+
+FINANCIAL_ROW_FIELDS = (
+    ("revenue", ("TOTAL_OPERATE_INCOME", "OPERATE_INCOME"), "profit"),
+    ("operating_cost", ("OPERATE_COST",), "profit"),
+    ("parent_net_profit", ("PARENT_NETPROFIT",), "profit"),
+    ("net_profit", ("NETPROFIT",), "profit"),
+    ("accounts_receivable", ("ACCOUNTS_RECE",), "balance"),
+    ("contract_liabilities", ("CONTRACT_LIAB",), "balance"),
+    ("short_term_loan", ("SHORT_LOAN",), "balance"),
+    ("long_term_loan", ("LONG_LOAN",), "balance"),
+    ("total_equity", ("TOTAL_EQUITY",), "balance"),
+    ("total_assets", ("TOTAL_ASSETS",), "balance"),
+)
+
+
+def ratio(numerator: Any, denominator: Any) -> float | None:
+    try:
+        if numerator is None or not float(denominator):
+            return None
+        return clean_scalar(float(numerator) / float(denominator) * 100)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+@app.get("/api/company/{raw_code}/financials")
+def financials(
+    raw_code: str,
+    periods: int = Query(4, ge=1, le=8),
+    refresh: bool = False,
+    mode: SourceMode = "official",
+) -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+    if mode == "strict":
+        return response(
+            {"rows": []},
+            [],
+            ["仅官方来源模式不展示缺少官方结构化接口的报告期财务明细。"],
+            status="empty",
+        )
+    try:
+        profits, balances = financial_frames(code, refresh)
+    except Exception as exc:
+        return response({"rows": []}, [], [f"财务报表获取失败：{type(exc).__name__}: {exc}"], status="error")
+    profit_by_period = {report_period(row): row for row in profits if report_period(row)}
+    balance_by_period = {report_period(row): row for row in balances if report_period(row)}
+    selected = sorted(set(profit_by_period) | set(balance_by_period), reverse=True)[:periods]
+    if not selected:
+        return response({"rows": []}, [], ["未取得结构化利润表与资产负债表。"], status="empty")
+
+    sources: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    for period in selected:
+        source_id = f"eastmoney-financial-{code}-{period}"
+        sources.append(
+            source(
+                source_id,
+                "东方财富",
+                f"{code} {period} 结构化财务报表",
+                quote_url(code),
+                period=period,
+                tier="secondary",
+            )
+        )
+        frames = {"profit": profit_by_period.get(period, {}), "balance": balance_by_period.get(period, {})}
+        values = {
+            key: first_value(frames[frame], names) for key, names, frame in FINANCIAL_ROW_FIELDS
+        }
+        revenue = number_or_none(values["revenue"])
+        cost = number_or_none(values["operating_cost"])
+        rows.append(
+            {
+                "period": period,
+                **{key: values[key] for key in ("revenue", "parent_net_profit", "net_profit")},
+                "gross_margin_percent": (
+                    ratio(revenue - cost, revenue) if revenue is not None and cost is not None else None
+                ),
+                "return_on_assets_percent": ratio(values["net_profit"], values["total_assets"]),
+                **{
+                    key: values[key]
+                    for key in (
+                        "accounts_receivable",
+                        "contract_liabilities",
+                        "short_term_loan",
+                        "long_term_loan",
+                        "total_equity",
+                        "total_assets",
+                    )
+                },
+                "source_id": source_id,
+            }
+        )
+    warnings = ["毛利率按（营业总收入−营业成本）÷营业总收入计算，资产利润率按报告期净利润÷期末总资产计算，均未年化。"]
+    if any(row["gross_margin_percent"] is None for row in rows):
+        warnings.append("部分报告期未披露营业成本，对应毛利率留空。")
+    try:
+        report_src = latest_report_source(code, refresh)
+    except Exception:
+        report_src = None
+    if report_src:
+        sources.append(report_src)
+    else:
+        warnings.append("未能回链最新定期报告原文；结构化财务数据仍标记为二手来源。")
+    return response({"rows": rows}, sources, warnings)
+
+
+def shareholder_research(code: str, refresh: bool = False) -> dict[str, Any]:
+    return cached(
+        f"em_shareholder_research_{code}",
+        12 * 3600,
+        lambda: em_f10("ShareholderResearch", "PageAjax", {"code": market_symbol(code)}),
+        refresh,
+    )
+
+
+def research_page(code: str, page: str, period: str, refresh: bool = False) -> list[dict[str, Any]]:
+    key = page.replace("Page", "").lower()
+    payload = cached(
+        f"em_{key}_{code}_{period.replace('-', '')}",
+        12 * 3600,
+        lambda: em_f10("ShareholderResearch", page, {"code": market_symbol(code), "date": period}),
+        refresh,
+    )
+    return payload.get(key) or []
+
+
+def report_dates(payload: dict[str, Any], key: str, field_name: str, limit: int = 2) -> list[str]:
+    rows = payload.get(key) or []
+    dates = sorted({parse_date(row.get(field_name)) for row in rows if parse_date(row.get(field_name))}, reverse=True)
+    return dates[:limit]
+
+
+HOLDER_TYPE_CATEGORIES = {
+    "私募基金": "private_fund",
+    "全国社保基金": "social_security",
+    "证券投资基金": "public_fund",
+    "保险产品": "insurance",
+    "QFII": "qfii",
+}
+HOLDER_NAME_CATEGORIES = (
+    ("private_fund", ("私募",)),
+    ("social_security", ("全国社保基金", "社保基金")),
+    ("qfii", ("QFII",)),
+)
+
+
+def holder_category(name: str, holder_type: str) -> str | None:
+    category = HOLDER_TYPE_CATEGORIES.get(holder_type)
+    if category:
+        return category
+    for fallback, words in HOLDER_NAME_CATEGORIES:
+        if any(word in name for word in words):
+            return fallback
+    return None
+
+
+@app.get("/api/company/{raw_code}/institutions")
+def institutions(raw_code: str, refresh: bool = False, mode: SourceMode = "official") -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+    if mode == "strict":
+        return response(
+            {"aggregate": [], "public_funds": [], "free_float_holders": []},
+            [],
+            ["仅官方来源模式不展示二手机构持股汇总。"],
+            status="empty",
+        )
+    try:
+        payload = shareholder_research(code, refresh)
+    except Exception as exc:
+        return response({}, [], [f"机构持股获取失败：{type(exc).__name__}: {exc}"], status="error")
+
+    warnings: list[str] = []
+    sources: list[dict[str, Any]] = []
+    holding_periods = report_dates(payload, "jgcc_date", "REPORT_DATE")
+    fund_periods = report_dates(payload, "jjcg_date", "REPORT_DATE")
+    holder_periods = report_dates(payload, "sdltgd_date", "END_DATE", limit=3)
+
+    def rows_for(page: str, key: str, period: str, index: int) -> list[dict[str, Any]]:
+        if index == 0 and payload.get(key):
+            return payload[key]
+        return research_page(code, page, period, refresh)
+
+    def module_source(name: str, title: str, period: str) -> dict[str, Any]:
+        src = source(
+            f"eastmoney-{name}-{code}-{period}",
+            "东方财富",
+            f"{code} {title}",
+            f"{EASTMONEY_F10}/ShareholderResearch/Index?type=web&code={market_symbol(code)}",
+            period=period,
+            tier="secondary",
+        )
+        sources.append(src)
+        return src
+
+    aggregate: list[dict[str, Any]] = []
+    for index, period in enumerate(holding_periods):
+        try:
+            rows = rows_for("PageJGCC", "jgcc", period, index)
+        except Exception as exc:
+            warnings.append(f"{period} 机构持股汇总获取失败：{type(exc).__name__}")
+            continue
+        src = module_source("institution-holding", "机构持股汇总", period)
+        for row in rows:
+            label = {"00": "机构合计", "01": "基金"}.get(str(row.get("ORG_TYPE")))
+            if not label:
+                continue
+            aggregate.append(
+                {
+                    "period": period,
+                    "org_type": label,
+                    "institution_count": clean_scalar(row.get("TOTAL_ORG_NUM")),
+                    "shares": clean_scalar(row.get("TOTAL_FREE_SHARES")),
+                    "float_share_percent": clean_scalar(row.get("TOTAL_SHARES_RATIO")),
+                    "total_share_percent": clean_scalar(row.get("ALL_SHARES_RATIO")),
+                    "source_id": src["source_id"],
+                }
+            )
+    if aggregate:
+        warnings.append("东方财富机构持股接口未返回其余机构类别的名称，本表只展示可确定标注的“机构合计”与“基金”。")
+
+    funds_by_period: dict[str, dict[str, dict[str, Any]]] = {}
+    for index, period in enumerate(fund_periods):
+        try:
+            rows = rows_for("PageJJCG", "jjcg", period, index)
+        except Exception as exc:
+            warnings.append(f"{period} 基金持股获取失败：{type(exc).__name__}")
+            continue
+        src = module_source("fund-holding", "基金持股明细", period)
+        funds_by_period[period] = {
+            str(row.get("HOLDER_CODE") or row.get("HOLDER_NAME")): {
+                "period": period,
+                "name": row.get("HOLDER_NAME"),
+                "fund_code": row.get("HOLDER_CODE"),
+                "shares": clean_scalar(row.get("TOTAL_SHARES")),
+                "market_value": clean_scalar(row.get("HOLD_VALUE")),
+                "total_share_percent": clean_scalar(row.get("TOTALSHARES_RATIO")),
+                "source_id": src["source_id"],
+            }
+            for row in rows
+        }
+    public_funds: list[dict[str, Any]] = []
+    if fund_periods:
+        latest = funds_by_period.get(fund_periods[0], {})
+        prior = funds_by_period.get(fund_periods[1], {}) if len(fund_periods) > 1 else {}
+        for key, item in latest.items():
+            previous = prior.get(key)
+            item = dict(item)
+            if previous:
+                item["previous_shares"] = previous["shares"]
+                try:
+                    item["share_change"] = clean_scalar(float(item["shares"]) - float(previous["shares"]))
+                except (TypeError, ValueError):
+                    item["share_change"] = None
+            public_funds.append(item)
+        for key, item in prior.items():
+            if key not in latest:
+                public_funds.append({**item, "exited": True})
+        warnings.append("基金持股明细为东方财富按持股规模返回的前若干只公募基金，未覆盖全部持有人。")
+
+    holders: list[dict[str, Any]] = []
+    for index, period in enumerate(holder_periods):
+        try:
+            rows = rows_for("PageSDLTGD", "sdltgd", period, index)
+        except Exception as exc:
+            warnings.append(f"{period} 十大流通股东获取失败：{type(exc).__name__}")
+            continue
+        src = module_source("free-float-holders", "十大流通股东", period)
+        for row in rows:
+            name = str(row.get("HOLDER_NAME") or "")
+            holder_type = str(row.get("HOLDER_TYPE") or "").strip()
+            holders.append(
+                {
+                    "period": period,
+                    "name": name,
+                    "holder_type": holder_type or None,
+                    "category": holder_category(name, holder_type),
+                    "shares": clean_scalar(row.get("HOLD_NUM")),
+                    "float_share_percent": clean_scalar(row.get("FREE_HOLDNUM_RATIO")),
+                    "change": row.get("HOLD_NUM_CHANGE"),
+                    "change_percent": clean_scalar(row.get("CHANGE_RATIO")),
+                    "source_id": src["source_id"],
+                }
+            )
+    by_category = {
+        category: [item for item in holders if item["category"] == category]
+        for category in ("private_fund", "social_security", "public_fund", "insurance", "qfii")
+    }
+    if holder_periods:
+        warnings.append(
+            f"持有人类别为东方财富对十大流通股东标注的 HOLDER_TYPE，覆盖 {'、'.join(holder_periods)} "
+            "共 " + str(len(holder_periods)) + " 个报告期；未进入十大流通股东的持仓不在任何公开逐股披露渠道内。"
+        )
+    for category, label in (
+        ("private_fund", "私募基金"),
+        ("social_security", "社保基金"),
+    ):
+        if not by_category[category]:
+            warnings.append(f"最近 {len(holder_periods)} 个报告期的十大流通股东中没有被标注为{label}的持有人。")
+    return response(
+        {
+            "aggregate": aggregate,
+            "public_funds": public_funds,
+            "free_float_holders": holders,
+            "social_security": by_category["social_security"],
+            "private_fund_matches": by_category["private_fund"],
+            "qfii": by_category["qfii"],
+            "insurance": by_category["insurance"],
+            "holder_periods": holder_periods,
+        },
+        sources,
+        warnings,
+    )
+
+
+EASTMONEY_FLOW_CALIBER = "主力净流入（超大单＋大单，东方财富口径）"
+SINA_FLOW_CALIBER = "全部委托单净流入（新浪财经口径）"
+
+
+def sina_money_flow(code: str, days: int, source_id: str, refresh: bool = False) -> list[dict[str, Any]]:
+    def load() -> list[dict[str, Any]]:
+        value = requests.get(
+            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs",
+            params={"page": "1", "num": "60", "sort": "opendate", "asc": "0", "daima": market_symbol(code, lower=True)},
+            headers={**BROWSER_HEADERS, "Referer": "https://finance.sina.com.cn/"},
+            timeout=20,
+        )
+        value.raise_for_status()
+        rows = value.json()
+        return rows if isinstance(rows, list) else []
+
+    records = cached(f"sina_moneyflow_{code}", 3600, load, refresh)
+    if not records:
+        raise ValueError("新浪资金流入趋势响应为空")
+    flow: list[dict[str, Any]] = []
+    for row in records[:days]:
+        flow.append(
+            {
+                "date": parse_date(row.get("opendate")),
+                "close": number_or_none(row.get("trade")),
+                "change_percent": number_or_none(row.get("changeratio"), 100),
+                "main_net": number_or_none(row.get("netamount")),
+                "main_net_percent": number_or_none(row.get("ratioamount"), 100),
+                "super_large_net": number_or_none(row.get("r0_net")),
+                "source_id": source_id,
+            }
+        )
+    flow.reverse()
+    return flow
+
+
+@app.get("/api/company/{raw_code}/moneyflow")
+def moneyflow(
+    raw_code: str,
+    days: int = Query(22, ge=1, le=120),
+    refresh: bool = False,
+    mode: SourceMode = "official",
+) -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+    if mode == "strict":
+        return response(
+            {"daily_main_flow": [], "chip_cost": []},
+            [],
+            ["仅官方来源模式不展示商业平台的主力资金与筹码成本估算。"],
+            status="empty",
+        )
+    market = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}[exchange_for(code)]
+    sources: list[dict[str, Any]] = []
+    warnings: list[str] = [
+        "主力资金为交易平台按委托单规模划分的成交统计，不是监管口径的机构买卖；筹码成本为平台依成交分布推算的估计值，不是披露数据。"
+    ]
+    flow: list[dict[str, Any]] = []
+    chips: list[dict[str, Any]] = []
+    caliber = EASTMONEY_FLOW_CALIBER
+    flow_id = f"eastmoney-moneyflow-{code}"
+    chip_id = f"eastmoney-chip-{code}"
+
+    def load_flow() -> list[dict[str, Any]]:
+        return frame_records(ak.stock_individual_fund_flow(stock=code, market=market))
+
+    def load_chips() -> list[dict[str, Any]]:
+        return frame_records(ak.stock_cyq_em(symbol=code))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        flow_future = pool.submit(cached, f"moneyflow_{code}", 3600, load_flow, refresh)
+        chip_future = pool.submit(cached, f"chips_{code}", 3600, load_chips, refresh)
+        try:
+            for row in flow_future.result()[-days:]:
+                flow.append(
+                    {
+                        "date": parse_date(first_value(row, ("日期",))),
+                        "close": first_value(row, ("收盘价",)),
+                        "change_percent": first_value(row, ("涨跌幅",)),
+                        "main_net": first_value(row, ("主力净流入-净额",)),
+                        "main_net_percent": first_value(row, ("主力净流入-净占比",)),
+                        "super_large_net": first_value(row, ("超大单净流入-净额",)),
+                        "large_net": first_value(row, ("大单净流入-净额",)),
+                        "medium_net": first_value(row, ("中单净流入-净额",)),
+                        "small_net": first_value(row, ("小单净流入-净额",)),
+                        "source_id": flow_id,
+                    }
+                )
+            if flow:
+                sources.append(
+                    source(
+                        flow_id,
+                        "东方财富",
+                        f"{code} 个股资金流向",
+                        "https://data.eastmoney.com/zjlx/detail.html",
+                        tier="secondary",
+                    )
+                )
+            else:
+                warnings.append("未取得该证券的逐日主力资金数据。")
+        except Exception as exc:
+            warnings.append(f"东方财富主力资金获取失败：{type(exc).__name__}: {exc}")
+            try:
+                flow_id = f"sina-moneyflow-{code}"
+                caliber = SINA_FLOW_CALIBER
+                flow = sina_money_flow(code, days, flow_id, refresh)
+                sources.append(
+                    source(
+                        flow_id,
+                        "新浪财经",
+                        f"{code} 资金流入趋势",
+                        f"https://finance.sina.com.cn/realstock/company/{market_symbol(code, lower=True)}/nc.shtml",
+                        tier="secondary",
+                    )
+                )
+                warnings.append(
+                    "东方财富资金流不可用，已改用新浪财经逐日资金流入趋势；该口径为全部委托单净流入与超大单净流入，与东方财富“主力（超大单＋大单）”口径不同。"
+                )
+            except Exception as fallback_exc:
+                warnings.append(f"新浪备用资金流获取失败：{type(fallback_exc).__name__}: {fallback_exc}")
+        try:
+            for row in chip_future.result()[-3:]:
+                chips.append(
+                    {
+                        "date": parse_date(first_value(row, ("日期",))),
+                        "average_cost": first_value(row, ("平均成本",)),
+                        "profit_ratio_percent": number_or_none(first_value(row, ("获利比例",)), 100),
+                        "cost_90_low": first_value(row, ("90成本-低",)),
+                        "cost_90_high": first_value(row, ("90成本-高",)),
+                        "concentration_90_percent": number_or_none(first_value(row, ("90集中度",)), 100),
+                        "source_id": chip_id,
+                    }
+                )
+            if chips:
+                sources.append(
+                    source(
+                        chip_id,
+                        "东方财富",
+                        f"{code} 筹码分布",
+                        quote_url(code),
+                        tier="secondary",
+                    )
+                )
+            else:
+                warnings.append("未取得该证券的筹码分布数据。")
+        except Exception as exc:
+            warnings.append(f"筹码成本获取失败：{type(exc).__name__}: {exc}")
+    return response({"daily_main_flow": flow, "chip_cost": chips, "caliber": caliber}, sources, warnings)
+
+
+@app.get("/api/company/{raw_code}/research")
+def research(
+    raw_code: str,
+    months: int = Query(6, ge=1, le=24),
+    refresh: bool = False,
+    mode: SourceMode = "official",
+) -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+    if mode == "strict":
+        return response(
+            {"surveys": [], "reports": []},
+            [],
+            ["仅官方来源模式不展示二手机构调研统计与卖方研报。"],
+            status="empty",
+        )
+    since = (date.today() - timedelta(days=round(months * 30.44))).isoformat()
+    sources: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    surveys: list[dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
+    survey_id = f"eastmoney-survey-{code}"
+    report_id = f"eastmoney-research-{code}"
+
+    def load_surveys() -> list[dict[str, Any]]:
+        return em_datacenter(
+            "RPT_ORG_SURVEY",
+            "SECURITY_CODE,NOTICE_DATE,RECEIVE_START_DATE,RECEIVE_OBJECT,RECEIVE_PLACE,"
+            "RECEIVE_WAY_EXPLAIN,INVESTIGATORS,RECEPTIONIST,NUMBERNEW",
+            f'(IS_SOURCE="1")(SECURITY_CODE="{code}")(RECEIVE_START_DATE>\'{since}\')',
+            "RECEIVE_START_DATE",
+        )
+
+    def load_reports() -> list[dict[str, Any]]:
+        return frame_records(ak.stock_research_report_em(symbol=code))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        survey_future = pool.submit(cached, f"surveys_{code}_{months}", 12 * 3600, load_surveys, refresh)
+        report_future = pool.submit(cached, f"reports_em_{code}", 12 * 3600, load_reports, refresh)
+        try:
+            for row in survey_future.result():
+                surveys.append(
+                    {
+                        "survey_date": parse_date(row.get("RECEIVE_START_DATE")),
+                        "announced_at": parse_date(row.get("NOTICE_DATE")),
+                        "institution_count": row.get("NUMBERNEW"),
+                        "receive_way": row.get("RECEIVE_WAY_EXPLAIN"),
+                        "receive_object": row.get("RECEIVE_OBJECT"),
+                        "receive_place": row.get("RECEIVE_PLACE"),
+                        "receptionist": row.get("RECEPTIONIST"),
+                        "investigators": row.get("INVESTIGATORS"),
+                        "source_id": survey_id,
+                    }
+                )
+            if surveys:
+                sources.append(
+                    source(
+                        survey_id,
+                        "东方财富",
+                        f"{code} 机构调研记录",
+                        "https://data.eastmoney.com/jgdy/",
+                        period=f"{since} 至 {date.today().isoformat()}",
+                        tier="secondary",
+                    )
+                )
+            else:
+                warnings.append(f"最近 {months} 个月未检索到已公告的机构调研记录。")
+        except Exception as exc:
+            warnings.append(f"机构调研获取失败：{type(exc).__name__}: {exc}")
+        try:
+            for row in report_future.result():
+                published = parse_date(first_value(row, ("日期",)))
+                if not published or published < since:
+                    continue
+                reports.append(
+                    {
+                        "published_at": published,
+                        "title": first_value(row, ("报告名称",)),
+                        "institution": first_value(row, ("机构",)),
+                        "rating": first_value(row, ("东财评级",)),
+                        "url": first_value(row, ("报告PDF链接",)),
+                        "source_id": report_id,
+                    }
+                )
+            if reports:
+                sources.append(
+                    source(
+                        report_id,
+                        "东方财富",
+                        f"{code} 个股研究报告",
+                        f"https://data.eastmoney.com/report/{code}.html",
+                        period=f"{since} 至 {date.today().isoformat()}",
+                        tier="secondary",
+                    )
+                )
+            else:
+                warnings.append(f"最近 {months} 个月未检索到卖方研究报告。")
+        except Exception as exc:
+            warnings.append(f"研究报告获取失败：{type(exc).__name__}: {exc}")
+    warnings.append("调研纪要与研报结论未做摘要或改写；请点击原文链接核对机构观点。")
+    return response({"surveys": surveys, "reports": reports}, sources, warnings)
+
+
+NEGATIVE_WORDS = (
+    "处罚", "罚款", "警示函", "监管措施", "问询函", "关注函", "立案", "调查", "诉讼", "仲裁",
+    "违规", "违法", "更正", "致歉", "退市风险", "风险警示", "被执行", "失信", "冻结",
+    "债务逾期", "业绩预减", "业绩预亏", "商誉减值", "停产", "召回",
+)
+
+
+def matched_words(title: str) -> list[str]:
+    return [word for word in NEGATIVE_WORDS if word in title]
+
+
+@app.get("/api/company/{raw_code}/sentiment")
+def sentiment(
+    raw_code: str,
+    months: int = Query(12, ge=1, le=36),
+    news_limit: int = Query(5, ge=1, le=30),
+    refresh: bool = False,
+    mode: SourceMode = "official",
+) -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+    end = date.today()
+    start = end - timedelta(days=round(months * 30.44))
+    sources: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    announcements: list[dict[str, Any]] = []
+    news: list[dict[str, Any]] = []
+
+    try:
+        records = filings_since(filing_index(code, refresh), start.isoformat())
+        for index, row in enumerate(records):
+            title = str(first_value(row, ("公告标题", "标题", "announcementTitle")) or "")
+            words = matched_words(title)
+            if not words:
+                continue
+            published = parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime")))
+            url = str(first_value(row, ("公告链接", "网址", "url")) or CNINFO_HOME)
+            source_id = f"cninfo-negative-{code}-{published or index}-{index}"
+            sources.append(source(source_id, "巨潮资讯", title, url, published_at=published))
+            announcements.append(
+                {
+                    "published_at": published,
+                    "title": title,
+                    "url": url,
+                    "matched_keywords": words,
+                    "source_id": source_id,
+                }
+            )
+        announcements.sort(key=lambda item: item["published_at"] or "", reverse=True)
+    except Exception as exc:
+        warnings.append(f"公告舆情检索失败：{type(exc).__name__}: {exc}")
+
+    if mode != "strict":
+        try:
+            records = cached(
+                f"news_{code}",
+                6 * 3600,
+                lambda: frame_records(ak.stock_news_em(symbol=code)),
+                refresh,
+            )
+            dated: list[tuple[str, dict[str, Any]]] = []
+            for row in records:
+                title = str(first_value(row, ("新闻标题", "标题")) or "").strip()
+                url = str(first_value(row, ("新闻链接",)) or "").strip()
+                stamp = str(first_value(row, ("发布时间",)) or "").strip()
+                published = parse_date(stamp)
+                if not title or not url or not published:
+                    continue
+                dated.append((stamp, {
+                    "published_at": published,
+                    "published_time": stamp,
+                    "event": title,
+                    "url": url,
+                    "publisher": first_value(row, ("文章来源",)),
+                    "matched_keywords": matched_words(title),
+                }))
+            dated.sort(key=lambda item: item[0], reverse=True)
+            for index, (_, item) in enumerate(dated[:news_limit]):
+                source_id = f"eastmoney-news-{code}-{index}"
+                sources.append(
+                    source(
+                        source_id,
+                        str(item["publisher"] or "东方财富"),
+                        item["event"],
+                        item["url"],
+                        published_at=item["published_at"],
+                        tier="secondary",
+                    )
+                )
+                news.append({**item, "source_id": source_id})
+            if not news:
+                warnings.append("未取得该证券的可链接个股新闻。")
+        except Exception as exc:
+            warnings.append(f"个股新闻检索失败：{type(exc).__name__}: {exc}")
+    else:
+        warnings.append("仅官方来源模式不检索二手个股新闻。")
+
+    if not announcements:
+        warnings.append(f"最近 {months} 个月的公告标题未命中负面关键词。")
+    warnings.append(
+        f"公告列表按负面关键词筛选；新闻列表不做筛选，按发布时间倒序取最近 {news_limit} 条，"
+        "命中关键词的条目会另行标出。本模块只做标题关键词匹配，不判断事实性质与影响，请核对原文。"
+    )
+    return response(
+        {"announcements": announcements, "news": news, "keywords": list(NEGATIVE_WORDS)},
+        sources,
+        warnings,
+        status=None if announcements or news else "empty",
+    )
+
+
+SSE_COMPANY_PAGE = "https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE={code}"
+SSE_NOTICE_PAGE = "https://www.sse.com.cn/disclosure/listedinfo/announcement/index.shtml?productId={code}"
+SZSE_COMPANY_PAGE = "https://www.szse.cn/certificate/individual/index.html?code={code}"
+SZSE_NOTICE_PAGE = "https://www.szse.cn/disclosure/listed/notice/index.html"
+BSE_COMPANY_PAGE = "https://www.bse.cn/products/neeq_listed_companies/general_information.html?companyCode={code}"
+BSE_NOTICE_PAGE = "https://www.bse.cn/products/neeq_listed_companies/related_announcement.html?companyCode={code}"
+CNINFO_STOCK_PAGE = "http://www.cninfo.com.cn/new/disclosure/stock?stockCode={code}&orgId={org}"
+CNINFO_SEARCH_PAGE = "http://www.cninfo.com.cn/new/fulltextSearch?keyWord={code}"
+
+
+def sse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
+    def load() -> dict[str, Any]:
+        value = requests.get(
+            "http://query.sse.com.cn/commonQuery.do",
+            params={
+                "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GPGK_GSGK_C",
+                "COMPANY_CODE": code,
+                "isPagination": "false",
+            },
+            headers={**BROWSER_HEADERS, "Referer": "http://www.sse.com.cn/"},
+            timeout=25,
+        )
+        value.raise_for_status()
+        rows = value.json().get("result") or []
+        return rows[0] if rows else {}
+
+    return cached(f"sse_company_{code}", 24 * 3600, load, refresh)
+
+
+def szse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
+    def load() -> dict[str, Any]:
+        value = requests.get(
+            "https://www.szse.cn/api/report/index/companyGeneralization",
+            params={"secCode": code},
+            headers={**BROWSER_HEADERS, "Referer": "https://www.szse.cn/"},
+            timeout=25,
+        )
+        value.raise_for_status()
+        payload = value.json()
+        return {**(payload.get("data") or {}), "plate": payload.get("plate")}
+
+    return cached(f"szse_company_{code}", 24 * 3600, load, refresh)
+
+
+def bse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
+    def load() -> dict[str, Any]:
+        value = requests.post(
+            "https://www.bse.cn/nqxxController/nqxxCnzq.do",
+            data={
+                "page": "0",
+                "typejb": "T",
+                "xxfcbj[]": "2",
+                "xxzqdm": code,
+                "sortfield": "xxzqdm",
+                "sorttype": "asc",
+            },
+            headers=BROWSER_HEADERS,
+            timeout=25,
+        )
+        value.raise_for_status()
+        text = value.text
+        payload = json.loads(text[text.find("[") : -1])
+        rows = (payload[0] or {}).get("content") or []
+        return rows[0] if rows else {}
+
+    return cached(f"bse_company_{code}", 24 * 3600, load, refresh)
+
+
+EXCHANGE_FIELD_MAP = {
+    "SSE": (
+        ("full_name", ("FULL_NAME",), 1),
+        ("english_name", ("FULL_NAME_EN",), 1),
+        ("listing_date", ("A_LIST_DATE",), 1),
+        ("listing_status", ("STATE_CODE_A_DESC",), 1),
+        ("board", ("SEC_TYPE",), 1),
+        ("csrc_industry", ("CSRC_GREAT_CODE_DESC",), 1),
+        ("legal_representative", ("LEGAL_REPRESENTATIVE",), 1),
+        ("secretary", ("NAME",), 1),
+        ("registered_address", ("REG_ADDRESS",), 1),
+        ("office_address", ("OFFICE_ADDRESS",), 1),
+        ("area", ("AREA_NAME",), 1),
+        ("email", ("E_MAIL_ADDRESS",), 1),
+        ("investor_phone", ("INVESTOR_PHONE",), 1),
+    ),
+    "SZSE": (
+        ("full_name", ("gsqc",), 1),
+        ("english_name", ("ywqc",), 1),
+        ("listing_date", ("agssrq",), 1),
+        ("board", ("plate",), 1),
+        ("csrc_industry", ("sshymc",), 1),
+        ("registered_address", ("zcdz",), 1),
+        ("area", ("sheng", "dldq"), 1),
+        ("website", ("http",), 1),
+        ("total_shares", ("agzgb",), 10000),
+        ("float_shares", ("agltgb",), 10000),
+    ),
+    "BSE": (
+        ("english_name", ("xxywjc",), 1),
+        ("listing_date", ("xxgprq", "fxssrq"), 1),
+        ("csrc_industry", ("xxhyzl",), 1),
+        ("area", ("xxssdq",), 1),
+        ("total_shares", ("xxzgb",), 1),
+        ("float_shares", ("xxfxsgb",), 1),
+        ("transfer_mode", ("xxzrlx",), 1),
+        ("sponsor", ("xxzbqs",), 1),
+    ),
+}
+EXCHANGE_PUBLISHER = {"SSE": "上海证券交易所", "SZSE": "深圳证券交易所", "BSE": "北京证券交易所"}
+SZSE_BOARDS = {"CY": "创业板", "ZB": "主板", "Z": "主板", "ZX": "中小板"}
+
+
+def exchange_org_id(code: str, refresh: bool = False) -> str | None:
+    try:
+        for row in filing_index(code, refresh):
+            match = re.search(r"orgId=([A-Za-z0-9]+)", str(first_value(row, ("公告链接", "网址", "url")) or ""))
+            if match:
+                return match.group(1)
+    except Exception:
+        return None
+    return None
+
+
+@app.get("/api/company/{raw_code}/exchange")
+def exchange(raw_code: str, refresh: bool = False, mode: SourceMode = "official") -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+
+    market = exchange_for(code)
+    publisher = EXCHANGE_PUBLISHER[market]
+    warnings: list[str] = []
+    sources: list[dict[str, Any]] = []
+    company_page = {
+        "SSE": SSE_COMPANY_PAGE,
+        "SZSE": SZSE_COMPANY_PAGE,
+        "BSE": BSE_COMPANY_PAGE,
+    }[market].format(code=code)
+    notice_page = {
+        "SSE": SSE_NOTICE_PAGE,
+        "SZSE": SZSE_NOTICE_PAGE,
+        "BSE": BSE_NOTICE_PAGE,
+    }[market].format(code=code)
+
+    source_id = f"{market.lower()}-company-{code}"
+    src = source(source_id, publisher, f"{code} 交易所上市公司信息", company_page)
+    loader = {"SSE": sse_company_record, "SZSE": szse_company_record, "BSE": bse_company_record}[market]
+    profile: dict[str, Any] = {}
+    try:
+        record = loader(code, refresh)
+        for key, names, multiplier in EXCHANGE_FIELD_MAP[market]:
+            raw = first_value(record, names)
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if raw in ("", "-", "--"):
+                    raw = None
+            if raw is None:
+                continue
+            if key in ("total_shares", "float_shares"):
+                raw = number_or_none(str(raw).replace(",", ""), multiplier)
+            if key == "board":
+                raw = SZSE_BOARDS.get(str(raw), raw)
+            if key == "listing_date":
+                raw = parse_date(raw)
+            item = field(raw, source_id)
+            if item:
+                profile[key] = item
+        if profile:
+            sources.append(src)
+        else:
+            warnings.append(f"{publisher}未返回该证券的上市公司登记信息。")
+    except Exception as exc:
+        warnings.append(f"{publisher}上市公司信息获取失败：{type(exc).__name__}: {exc}")
+
+    org_id = exchange_org_id(code, refresh)
+    links = [
+        {"label": f"{publisher}·公司概况", "url": company_page, "publisher": publisher, "tier": "official"},
+        {"label": f"{publisher}·公司公告", "url": notice_page, "publisher": publisher, "tier": "official"},
+        {
+            "label": "巨潮资讯·公司披露主页",
+            "url": CNINFO_STOCK_PAGE.format(code=code, org=org_id) if org_id else CNINFO_SEARCH_PAGE.format(code=code),
+            "publisher": "巨潮资讯",
+            "tier": "official",
+        },
+    ]
+    if not org_id:
+        warnings.append("未取得巨潮机构编号，公司披露主页链接降级为全文检索。")
+    warnings.append(
+        "交易所页面为动态加载，链接直达该公司条目；巨潮资讯是证监会指定的信息披露平台，年报等定期报告原文以其发布为准。"
+    )
+    return response({"market": market, "publisher": publisher, "profile": profile, "links": links}, sources, warnings)
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     checks: dict[str, Any] = {"service": "ok", "cache_dir": str(CACHE_DIR)}
     warnings: list[str] = []
     try:
-        checks["stock_master_count"] = len(stock_master())
+        audit = stock_master_audit(stock_master())
+        checks["stock_master_count"] = audit["total"]
         checks["stock_master"] = "ok"
+        checks["stock_master_coverage"] = audit
+        if not audit["integrity_ok"]:
+            warnings.append("股票代码表完整性检查未通过。")
     except Exception as exc:
         checks["stock_master"] = "error"
         warnings.append(f"股票代码表上游不可用：{type(exc).__name__}: {exc}")
     return response(checks, [], warnings, status="ok" if not warnings else "partial")
+
+
+@app.get("/api/coverage")
+def coverage(refresh: bool = False) -> dict[str, Any]:
+    try:
+        audit = stock_master_audit(stock_master(refresh))
+    except Exception as exc:
+        return response(
+            {},
+            [],
+            [f"股票代码表覆盖检查失败：{type(exc).__name__}: {exc}"],
+            status="error",
+        )
+
+    warnings: list[str] = []
+    official_sources = set(audit["refresh"].get("official_sources", []))
+    for exchange, source_id in MASTER_OFFICIAL_SOURCE.items():
+        if source_id not in official_sources:
+            warnings.append(
+                f"{'上交所' if exchange == 'SSE' else '深交所' if exchange == 'SZSE' else '北交所'}"
+                "官方代码表本轮未完成核验；搜索范围已由备用全市场表与最近缓存补齐。"
+            )
+    if not audit["integrity_ok"]:
+        warnings.append("代码表存在空市场、重复代码或非六位代码。")
+    used_source_ids = {
+        source_id for source_id, count in audit["source_counts"].items() if count
+    }
+    return response(
+        audit,
+        [master_source(source_id) for source_id in used_source_ids],
+        warnings,
+        status="ok" if not warnings else "partial",
+    )

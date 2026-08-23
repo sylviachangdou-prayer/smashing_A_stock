@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "stock-tool", "runtimeExecutable": "npm", "runtimeArgs": ["run", "local"], "port": 3000 }
+  ]
+}

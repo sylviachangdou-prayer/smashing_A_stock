@@ -12,8 +12,9 @@ export async function generateMetadata(): Promise<Metadata> {
     title: "A股公司研究台｜官方披露驱动的公司研究",
     description: "输入A股公司名称或代码，研究股东、财务、资金面、主营业务、同业竞争与重大合同，并回溯官方来源。",
     icons: {
-      icon: "/favicon.svg",
-      shortcut: "/favicon.svg",
+      icon: "/niu-oracle.svg",
+      shortcut: "/niu-oracle.svg",
+      apple: "/niu-oracle.svg",
     },
     openGraph: {
       title: "A股公司研究台",
