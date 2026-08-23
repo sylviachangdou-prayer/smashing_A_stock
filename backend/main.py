@@ -17,9 +17,9 @@ from typing import Any, Callable, Literal
 import akshare as ak
 import pandas as pd
 import requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pypdf import PdfReader
 from requests.adapters import HTTPAdapter
 from urllib.parse import urljoin
@@ -66,13 +66,60 @@ class TLS12Adapter(HTTPAdapter):
             **kwargs,
         )
 
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if origin.strip()
+]
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60"))
+RATE_LIMIT_HITS: dict[str, list[float]] = {}
+RATE_LIMIT_LOCK = Lock()
+
 app = FastAPI(title="A股信息查询本地服务", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+
+def rate_limit_exceeded(client: str) -> bool:
+    """Per-client sliding window. Protects the upstream sites, not the data."""
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return False
+    now = time.time()
+    with RATE_LIMIT_LOCK:
+        hits = [stamp for stamp in RATE_LIMIT_HITS.get(client, []) if now - stamp < 60]
+        if len(hits) >= RATE_LIMIT_PER_MINUTE:
+            RATE_LIMIT_HITS[client] = hits
+            return True
+        hits.append(now)
+        RATE_LIMIT_HITS[client] = hits
+        if len(RATE_LIMIT_HITS) > 512:
+            for stale in [key for key, value in RATE_LIMIT_HITS.items() if not value]:
+                RATE_LIMIT_HITS.pop(stale, None)
+        return False
+
+
+@app.middleware("http")
+async def limit_request_rate(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.url.path != "/api/health":
+        forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "")
+        client = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+        if rate_limit_exceeded(client):
+            return JSONResponse(
+                status_code=429,
+                content=response(
+                    {},
+                    [],
+                    [f"请求过于频繁：每个来源每分钟最多 {RATE_LIMIT_PER_MINUTE} 次。该限制用于保护上游披露站点。"],
+                    status="error",
+                ),
+            )
+    return await call_next(request)
 
 
 def now_iso() -> str:
@@ -94,6 +141,65 @@ def clean_scalar(value: Any) -> Any:
 def cache_file(key: str) -> Path:
     safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", key)
     return CACHE_DIR / f"{safe}.json"
+
+
+COMPANY_CACHE_LIMIT = int(os.environ.get("COMPANY_CACHE_LIMIT", "5"))
+MARGIN_CACHE_DAYS = int(os.environ.get("MARGIN_CACHE_DAYS", "24"))
+COMPANY_CODE_IN_KEY = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+CACHE_EVICT_LOCK = Lock()
+
+
+def cached_company_codes() -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
+    for path in CACHE_DIR.glob("*.json"):
+        match = COMPANY_CODE_IN_KEY.search(path.stem)
+        if match:
+            groups.setdefault(match.group(1), []).append(path)
+    return groups
+
+
+def prune_company_cache(keep: str | None = None) -> list[str]:
+    """Keep at most COMPANY_CACHE_LIMIT companies on disk, evicting least recently used."""
+    with CACHE_EVICT_LOCK:
+        groups = cached_company_codes()
+        if len(groups) <= COMPANY_CACHE_LIMIT:
+            return []
+        recency = {
+            code: max((path.stat().st_mtime for path in paths), default=0.0)
+            for code, paths in groups.items()
+        }
+        if keep in recency:
+            recency[keep] = time.time()
+        ordered = sorted(recency, key=lambda code: recency[code], reverse=True)
+        evicted: list[str] = []
+        for code in ordered[COMPANY_CACHE_LIMIT:]:
+            for path in groups[code]:
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+            evicted.append(code)
+        return evicted
+
+
+def prune_margin_cache() -> int:
+    """Daily margin snapshots cover the whole market and are shared across companies,
+    so they are capped by count per exchange instead of by company."""
+    removed = 0
+    with CACHE_EVICT_LOCK:
+        for exchange in ("SSE", "SZSE"):
+            files = sorted(
+                CACHE_DIR.glob(f"margin_{exchange}_*.json"),
+                key=lambda path: path.stem,
+                reverse=True,
+            )
+            for path in files[MARGIN_CACHE_DAYS:]:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+    return removed
 
 
 def cache_lock(key: str) -> Lock:
@@ -123,6 +229,9 @@ def cached(key: str, ttl_seconds: int, loader: Callable[[], Any], refresh: bool 
                 return value
         value = loader()
         _write_json_atomic(path, value)
+        code = COMPANY_CODE_IN_KEY.search(path.stem)
+        if code:
+            prune_company_cache(code.group(1))
         return value
 
 
@@ -1519,6 +1628,7 @@ def capital(
                     found.append((day, rows[0]))
             except Exception:
                 continue
+    prune_margin_cache()
     found.sort(key=lambda item: item[0], reverse=True)
     found = found[:days]
     if not found:

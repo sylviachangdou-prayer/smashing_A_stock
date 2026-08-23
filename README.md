@@ -16,7 +16,7 @@ npm run local
 - 健康检查：<http://127.0.0.1:8010/api/health>
 - 股票范围检查：<http://127.0.0.1:8010/api/coverage>
 
-首次运行会由 `uv` 按 `uv.lock` 安装 Python 依赖。代码表、财务、股东、两融和公告会写入 `.cache/stock_tool/`，页面中的“绕过缓存刷新”可重新抓取公司模块。
+首次运行会由 `uv` 按 `uv.lock` 安装 Python 依赖。缓存最多保留 5 家公司（`COMPANY_CACHE_LIMIT`）与每个交易所最近 24 个交易日的两融快照（`MARGIN_CACHE_DAYS`），写入时自动淘汰。接口默认限流每个来源每分钟 60 次（`RATE_LIMIT_PER_MINUTE`），跨域来源由 `ALLOWED_ORIGINS` 控制。代码表、财务、股东、两融和公告会写入 `.cache/stock_tool/`，页面中的“绕过缓存刷新”可重新抓取公司模块。
 
 ## 接口
 

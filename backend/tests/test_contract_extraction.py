@@ -534,3 +534,57 @@ def test_latest_filing_skips_summaries_and_builds_the_pdf_url():
 
     assert filing["title"] == "2025年年度报告"
     assert filing["pdf_url"] == "http://static.cninfo.com.cn/finalpage/2026-03-28/2.PDF"
+
+
+def test_company_cache_keeps_only_the_most_recent_companies(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(main, "COMPANY_CACHE_LIMIT", 2)
+    import time as _time
+
+    for index, code in enumerate(["600519", "300408", "000010"]):
+        for key in (f"profile_{code}", f"filings_{code}", f"em_sdltgd_{code}_20260331"):
+            path = tmp_path / f"{key}.json"
+            path.write_text("{}", encoding="utf-8")
+            _time.sleep(0.01)
+
+    evicted = main.prune_company_cache()
+
+    assert evicted == ["600519"]
+    remaining = set(main.cached_company_codes())
+    assert remaining == {"300408", "000010"}
+    assert not (tmp_path / "profile_600519.json").exists()
+
+
+def test_company_cache_ignores_shared_market_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "CACHE_DIR", tmp_path)
+    for key in ("stock_master", "margin_SSE_20260821", "sector_boards_industry", "market_headlines"):
+        (tmp_path / f"{key}.json").write_text("{}", encoding="utf-8")
+
+    assert main.cached_company_codes() == {}
+
+
+def test_margin_cache_is_capped_per_exchange(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(main, "MARGIN_CACHE_DAYS", 3)
+    for day in range(20260801, 20260806):
+        for exchange in ("SSE", "SZSE"):
+            (tmp_path / f"margin_{exchange}_{day}.json").write_text("[]", encoding="utf-8")
+
+    assert main.prune_margin_cache() == 4
+    kept = sorted(path.stem for path in tmp_path.glob("margin_SSE_*.json"))
+    assert kept == ["margin_SSE_20260803", "margin_SSE_20260804", "margin_SSE_20260805"]
+
+
+def test_rate_limit_allows_then_blocks(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 3)
+    monkeypatch.setattr(main, "RATE_LIMIT_HITS", {})
+
+    assert [main.rate_limit_exceeded("1.2.3.4") for _ in range(4)] == [False, False, False, True]
+    assert main.rate_limit_exceeded("5.6.7.8") is False
+
+
+def test_rate_limit_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 0)
+    monkeypatch.setattr(main, "RATE_LIMIT_HITS", {})
+
+    assert all(main.rate_limit_exceeded("1.2.3.4") is False for _ in range(50))
