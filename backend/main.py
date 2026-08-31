@@ -2206,14 +2206,14 @@ def annual_report_facts(
 
 
 def competition_disclosure(
-    code: str, refresh: bool = False
+    code: str, records: list[dict[str, Any]], refresh: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    records = filing_archive(code, refresh)
-    filing = latest_filing(
-        records,
-        r"(招股说明书|募集说明书)(（[^）]*）)?$",
-        r"摘要|确认意见|法律意见|核查意见|之|公告",
-    )
+    pattern = r"(招股说明书|募集说明书)(（[^）]*）)?$"
+    exclude = r"摘要|确认意见|法律意见|核查意见|之|公告"
+    # 先用已经抓好的近五年索引；只有里面没有发行文件时，才去爬十二年存档。
+    filing = latest_filing(records, pattern, exclude)
+    if not filing:
+        filing = latest_filing(filing_archive(code, refresh), pattern, exclude)
     if not filing:
         return {}, None
     text = filing_text(f"filing_offering_{code}_{filing['published_at']}", filing["pdf_url"], refresh)
@@ -2267,7 +2267,7 @@ def business(raw_code: str, refresh: bool = False, mode: SourceMode = "official"
         filings = []
         warnings.append(f"巨潮公告索引获取失败：{type(exc).__name__}: {exc}")
     annual_future = filing_pool.submit(annual_report_facts, code, filings, refresh)
-    competition_future = filing_pool.submit(competition_disclosure, code, refresh)
+    competition_future = filing_pool.submit(competition_disclosure, code, filings, refresh)
 
     cninfo_src = source(f"cninfo-profile-{code}", "巨潮资讯", f"{code} 公司概况", CNINFO_HOME)
     try:
