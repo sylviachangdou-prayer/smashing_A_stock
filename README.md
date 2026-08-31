@@ -1,3 +1,14 @@
+---
+title: Smashing A Stock API
+emoji: 🐂
+colorFrom: gray
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+---
+
 # A股公司研究台（本地试用版）
 
 按公司名称或六位代码查询沪深北 A 股公开信息。前端只渲染实际取得且带 `source_id` 的数据；上游缺失或超时会按模块单独显示，不生成替代值。
