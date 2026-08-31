@@ -40,7 +40,199 @@
 
 所以后端最低配是 **512 MB 内存**，1 GB 舒服；磁盘留 5–10 GB 给缓存。
 
-## 方案一：源码上 GitHub，程序跑在本地
+## 选定方案：后端 Hugging Face Space + 前端 Cloudflare Workers
+
+两边都免费、网址固定、不依赖你的电脑开着。已知代价写在最后。
+
+---
+
+### 第 0 步：确认本机是好的
+
+部署前先在本机跑一遍，确认代码本身没问题：
+
+```bash
+cd /Users/sylviadiathen/stock_tool
+npm run local
+```
+
+打开 <http://localhost:3000> 随便查一家公司，页面顶部的模块条应该大部分显示「完整」或「部分」。确认无误后 `Ctrl+C` 停掉。
+
+---
+
+### 第 1 步：把代码推到 GitHub
+
+Space 要从你的仓库拉代码，先确保 GitHub 上是最新的：
+
+```bash
+cd /Users/sylviadiathen/stock_tool
+git add -A
+git commit -m "Add Hugging Face Space container"
+git push
+```
+
+---
+
+### 第 2 步：注册 Hugging Face
+
+1. 打开 <https://huggingface.co/join>，用邮箱或 Google 注册。
+2. 去邮箱点验证链接。不验证不能建 Space。
+
+---
+
+### 第 3 步：建一个 Space
+
+1. 打开 <https://huggingface.co/new-space>
+2. 按这个填：
+
+   | 字段 | 填什么 |
+   | --- | --- |
+   | Owner | 你的用户名 |
+   | Space name | `smashing-a-stock-api` |
+   | License | 随意，`mit` 就行 |
+   | Select the Space SDK | **Docker** → **Blank**（不要选 Streamlit/Gradio） |
+   | Space hardware | **CPU basic · Free** |
+   | Visibility | **Public** |
+
+3. 点 **Create Space**。它会给你一个空仓库和一个地址：
+   `https://huggingface.co/spaces/你的用户名/smashing-a-stock-api`
+
+> **Visibility 为什么必须选 Public**：Private Space 的 API 需要带 token 才能访问，而前端是public
+> 网页，token 藏不住。用 Public Space + 后端限流 + CORS 白名单来控制滥用。
+
+---
+
+### 第 4 步：把代码推到 Space
+
+Space 本身是一个 git 仓库，和 GitHub 那个是两个地方。给本地仓库加第二个远端：
+
+```bash
+cd /Users/sylviadiathen/stock_tool
+git remote add space https://huggingface.co/spaces/你的用户名/smashing-a-stock-api
+git push space main
+```
+
+推的时候会要用户名和密码：
+
+- 用户名填你的 HF 用户名
+- **密码不是登录密码，是 Access Token**。去 <https://huggingface.co/settings/tokens> →
+  **Create new token** → 类型选 **Write** → 复制那串 `hf_...` 粘进去。
+
+推完回到 Space 页面，会看到 **Building**。第一次构建要装 akshare 全套依赖，约 5–10 分钟。
+点 **Logs** 能看进度。看到 **Running** 就成了。
+
+---
+
+### 第 5 步：确认后端活着
+
+浏览器打开：
+
+```
+https://你的用户名-smashing-a-stock-api.hf.space/api/health
+```
+
+注意这个地址的形式——用户名和 Space 名之间是**短横线**，不是斜杠。看到一段 JSON
+（含 `"status": "ok"` 或 `"partial"`）就说明后端起来了。这个地址就是下一步要用的后端地址。
+
+---
+
+### 第 6 步：授权 Cloudflare
+
+你已经注册过了，只需要让命令行拿到授权：
+
+```bash
+cd /Users/sylviadiathen/stock_tool
+npx wrangler login
+```
+
+浏览器会弹出授权页，点 **Allow**。
+
+---
+
+### 第 7 步：发布前端
+
+用上一步的后端地址：
+
+```bash
+bash scripts/deploy-web.sh https://你的用户名-smashing-a-stock-api.hf.space
+```
+
+脚本会先检查登录状态，再把后端地址烤进前端构建，然后发布。跑完会打印出网址，形如：
+
+```
+https://smashing-a-stock.你的子域名.workers.dev
+```
+
+如果这是你第一次用 Workers，它会在终端里让你挑一个 workers.dev 子域名，挑完就继续。
+
+---
+
+### 第 8 步：回到 Space 打开跨域白名单
+
+后端默认只允许 `localhost:3000`，现在要让它接受来自正式网址的请求。
+
+1. 打开 Space → **Settings** → 找到 **Variables and secrets**
+2. **New variable**（注意是 variable，不是 secret），填：
+
+   | Name | Value |
+   | --- | --- |
+   | `ALLOWED_ORIGINS` | `https://smashing-a-stock.你的子域名.workers.dev` |
+
+3. 保存后 Space 会自动重启，约一分钟。
+
+**不做这步的话**：网页能打开，但所有模块都会失败，浏览器控制台里全是 CORS 报错。
+
+---
+
+### 第 9 步：验收
+
+打开你的 workers.dev 网址，查一家公司，重点看页面顶部的模块条：
+
+| 模块 | 预期 |
+| --- | --- |
+| 实时行情、公司总览、基本情况、报告期财务 | 完整 / 部分 |
+| 机构持股、公募与私募、调研与研报、舆情、交易所登记 | 完整 / 部分 |
+| 资金与筹码 | **部分**——资金流会降级到新浪口径，筹码成本显示「未取得」 |
+
+模块条就是诊断工具。哪个显示「失败」，点开对应区块，底部「取数状态与来源」里有具体原因。
+
+---
+
+## 这套方案已知的代价
+
+**筹码成本拿不到。** `push2his.eastmoney.com` 从境外机器连不上，而它是筹码分布的唯一来源。
+页面会明确显示「未取得」并说明原因，不会拿别的数据凑。
+
+**东财资金流降级。** 同一个域名的问题。会自动切到新浪财经的全单净流入口径，
+表头会标注实际用的是哪个口径——两者不是一回事，不要混着看。
+
+**休眠。** 48 小时没人访问就休眠，下一个访客的请求会唤醒它。这个后端没有模型要加载，
+冷启动就是容器启动的时间，几十秒。要避免可以照 stylometry 那套做定时 ping，但对这个项目
+通常不值得。
+
+**缓存会清空。** 免费 Space 磁盘不持久，休眠或重启后 `/home/user/cache` 清空。
+影响是每家公司第一次查会慢（年报 PDF 要重下、巨潮索引要重爬）。缓存上限本来就只有
+5 家公司 / 34 MB，重建代价可控。
+
+**GitHub 和 Space 是两个仓库。** 以后改了代码要推两次：`git push` 给 GitHub，
+`git push space main` 给 Space。只推 GitHub 的话线上不会变。
+
+---
+
+## 方案对照（当时怎么选的）
+
+| | 临时隧道 | Tailscale Funnel | **HF Space** | VPS |
+| --- | --- | --- | --- | --- |
+| 费用 | 免费 | 免费 | **免费** | ¥30–60/月 |
+| 网址固定 | ❌ | ✅ | **✅** | ✅ |
+| 要你电脑开着 | 要 | 要 | **不要** | 不要 |
+| 筹码模块 | ✅ | ✅ | **❌** | 看选址 |
+| 缓存持久 | ✅ | ✅ | **❌** | ✅ |
+
+选 HF 是因为「随时可访问」这一条压倒了筹码那一个模块。
+
+---
+
+## 备选：源码上 GitHub，只在本地跑
 
 ```bash
 git clone https://github.com/sylviachangdou-prayer/smashing_A_stock.git
@@ -49,98 +241,7 @@ npm install
 npm run local
 ```
 
-零成本，网络在你自己这边，所有模块都能通。缺点是只有你自己能用。
-
-## 方案二（推荐）：后端留在本机，用隧道给出公网地址
-
-想让朋友也能打开，但又不想为"网络位置"这个坑付钱时，这是最省事的做法：
-**后端继续跑在你电脑上**（那里本来就连得通所有数据源），用隧道工具把 `127.0.0.1:8010` 映射成一个公网 HTTPS 地址，前端部署到 Cloudflare 免费额度，指向那个地址。
-
-两个常用工具，目前都有够用的免费额度（用之前确认一下当前政策）：
-
-- **Cloudflare Tunnel**：`cloudflared tunnel --url http://localhost:8010` 直接给一个临时 `*.trycloudflare.com` 地址，重启会变。想要固定地址需要一个挂在 Cloudflare 上的域名（域名本身约 ¥70/年），隧道本身免费。
-- **Tailscale Funnel**：给一个固定的 `*.ts.net` 地址，免费，不用买域名。
-
-```bash
-# 1) 本机照常起服务
-npm run local
-
-# 2) 另开一个终端，把后端暴露出去
-cloudflared tunnel --url http://localhost:8010
-# 记下它打印的 https://xxxx.trycloudflare.com
-
-# 3) 用这个地址重新构建前端并部署
-NEXT_PUBLIC_API_BASE=https://xxxx.trycloudflare.com npm run build
-npx wrangler deploy
-```
-
-代价：**你的电脑关机或断网，网站就没数据了**。朋友几个人偶尔看看的场景，这个代价通常可以接受。
-
-## 方案三：整套上一台小机器
-
-要 7×24 在线时用。VPS（Virtual Private Server）就是租来的一台 Linux 虚拟机，"1 核 1G"指 1 个 vCPU、1 GB 内存。
-**同一台机器上同时跑两个进程**——Python 后端占 8010 端口，Node 前端占 3000 端口——而不是把它们拆到两个平台上。
-
-选址按这个顺序：**香港/新加坡 > 境内 > 欧美**。境内机器网络最好，但绑域名对外提供服务需要 ICP 备案，个人办下来要几周。欧美机器最便宜，但前面说的那些接口会掉。
-
-价格区间（会变，下单前自己核）：香港/新加坡 1 核 1G 大约 ¥30–60/月，欧美同配置能到 ¥15–25/月。
-
-`docker-compose.yml`（放仓库根目录）：
-
-```yaml
-services:
-  api:
-    build: { context: ., dockerfile: Dockerfile.api }
-    ports: ["8010:8010"]
-    volumes: ["./.cache:/app/.cache"]   # 缓存必须落盘，否则每次重启全部重爬
-    restart: unless-stopped
-  web:
-    build: { context: ., dockerfile: Dockerfile.web }
-    environment:
-      NEXT_PUBLIC_API_BASE: "https://api.your-domain.com"
-    ports: ["3000:3000"]
-    depends_on: [api]
-    restart: unless-stopped
-```
-
-`Dockerfile.api`：
-
-```dockerfile
-FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev
-COPY backend ./backend
-EXPOSE 8010
-CMD ["uv", "run", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8010"]
-```
-
-`Dockerfile.web`：
-
-```dockerfile
-FROM node:22-slim
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-EXPOSE 3000
-CMD ["npm", "run", "start"]
-```
-
-## 后端能不能白嫖
-
-能找到免费额度，但对这个后端都不太合适，原因是同一个：
-
-- **免费额度基本都在欧美**。前面说的网络位置问题在这里最致命。
-- **休眠**。免费方案通常闲置几十分钟后停机，朋友下次打开要等冷启动。
-- **磁盘是临时的**。重启就清空 `.cache/`，等于每个访客都触发一次完整重爬——巨潮索引 4–10 秒、年报 PDF 2 秒，而且很快会被上游限流。
-- **内存**。512 MB 的免费档跑 pandas + akshare 是紧的（实测 138 MB 是稳态，加上 Node 前端就悬）。
-
-结论：**对这个后端，免费方案里唯一真正好用的是"方案二"的隧道**——因为它不租别人的服务器，只是把你本机的服务开一个口。
-
-需要区分清楚：以上四条里，真正卡死的是**网络位置**这一条，它是这个项目特有的（数据源全在境内）。如果一个后端不依赖境内网络，那么 **Hugging Face Spaces 的免费 Docker 档（2 vCPU / 16 GB 内存 / 50 GB 磁盘）是很够用的**，连几 GB 的模型权重都放得下，只是同样会休眠。判断标准就一条：你的后端要请求的服务，在欧美机器上连不连得通。
+零成本、所有模块都通、缓存持久，缺点是只有你自己能用。
 
 ## 关于 GitHub Pages
 
@@ -150,12 +251,23 @@ CMD ["npm", "run", "start"]
 
 既然 Cloudflare Workers 同样免费、这个项目本来就构建成 Worker、而且不用改代码，没必要绕 Pages 这一圈。
 
-## 上线前必须做的事
+## 环境变量一览
 
-1. **设 `ALLOWED_ORIGINS`**。默认只允许 `localhost:3000`。部署时改成正式前端域名（逗号分隔可以多个），否则别的站点能直接调用你的接口。
-2. **确认限流**。默认每个来源 IP 每分钟 60 次，超出返回 429。`RATE_LIMIT_PER_MINUTE` 可调，设 0 关闭。这道是防止爬虫顺着你的接口去压上游披露站点，导致你的 IP 被封。
-3. **要"只有我和朋友能看"再加一层身份验证**。上面两条挡的是滥用，不是身份。最简单的是 **Cloudflare Zero Trust → Access**（免费额度 50 人），给域名加邮箱验证码登录，不用改代码。
-4. **前端必须在 `NEXT_PUBLIC_API_BASE` 指向正式后端之后重新 `npm run build`**——这个变量是构建时注入的，改环境变量不重新构建不生效。
+后端全部通过环境变量配置，本机不设也能跑（用的是默认值）。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 允许跨域的前端地址，逗号分隔。**部署后必须设成正式网址** |
+| `RATE_LIMIT_PER_MINUTE` | `60` | 每个来源 IP 每分钟请求上限，超出返回 429。设 `0` 关闭 |
+| `COMPANY_CACHE_LIMIT` | `5` | 磁盘上最多保留几家公司的缓存 |
+| `MARGIN_CACHE_DAYS` | `24` | 每个交易所保留多少个交易日的两融快照 |
+| `STOCK_TOOL_CACHE_DIR` | 仓库内 `.cache/stock_tool` | 缓存目录。容器里指向家目录 |
+
+前端只有一个，且是**构建时**注入：
+
+| 变量 | 作用 |
+| --- | --- |
+| `NEXT_PUBLIC_API_BASE` | 后端地址。改了必须重新 `npm run build` 才生效，`scripts/deploy-web.sh` 已经包含这一步 |
 
 ## 缓存上限
 
@@ -173,6 +285,23 @@ CMD ["npm", "run", "start"]
 交易所和巨潮是法定公开披露，转述没有问题。东方财富、同花顺、新浪、腾讯是商业平台，条款一般禁止把它们的数据作为服务再对外提供。自己和朋友查阅属于正常使用；只要不做成对公众开放的数据服务、不提供批量导出，就不涉及"转发数据"。加访问控制既是为了防爬虫，也是把这条边界划清楚。
 
 ## 后期更新版本
+
+代码改完后，**两个仓库都要推**——GitHub 是源码，Space 是线上：
+
+```bash
+npm run lint && npm test && npm run test:api   # 三项都过再提交
+git add -A
+git commit -m "描述这次改了什么"
+git push          # GitHub
+git push space main   # Hugging Face Space，推完自动重新构建
+```
+
+只改了前端的话，还要重新发布一次前端：
+
+```bash
+bash scripts/deploy-web.sh https://你的用户名-smashing-a-stock-api.hf.space
+```
+
 
 日常改动：
 

@@ -27,7 +27,7 @@ from urllib3 import PoolManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CACHE_DIR = ROOT / ".cache" / "stock_tool"
+CACHE_DIR = Path(os.environ.get("STOCK_TOOL_CACHE_DIR") or ROOT / ".cache" / "stock_tool")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CNINFO_HOME = "https://www.cninfo.com.cn/new/index"
 EASTMONEY_QUOTE = "https://quote.eastmoney.com/"
