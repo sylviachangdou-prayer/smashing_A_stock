@@ -1,0 +1,70 @@
+# 让 Hugging Face Space 不进入 48 小时休眠。
+#
+# HF 文档：cpu-basic 的 Space 闲置 48 小时后休眠，而「任何访问都会重启它」——
+# 所以定时 ping 一次就能重置计时。这样不必买 $0.03/小时（约 $22/月）的
+# CPU Upgrade 也能常驻。
+#
+# 默认不工作：仓库变量 KEEP_WARM 不是 "on" 时，定时任务会立刻退出。
+# 日常开关（都在 GitHub 网页上点，不用改代码、不用 push）：
+#
+#   打开  Settings → Secrets and variables → Actions → Variables
+#         把 KEEP_WARM 设成 on
+#   关闭  把 KEEP_WARM 改成 off，或直接删掉这个变量
+#   立刻唤醒一次  Actions → Keep Space warm → Run workflow
+#
+# 还需要一个变量 SPACE_URL，例如
+#   https://sylviachangdou-prayer-smashing-a-stock-api.hf.space
+
+name: Keep Space warm
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"   # 每 6 小时；23 分错开整点，整点是 GitHub 最堵的时候
+  workflow_dispatch:          # 手动触发时无视 KEEP_WARM，总是执行
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检查开关
+        id: gate
+        env:
+          KEEP_WARM: ${{ vars.KEEP_WARM }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "手动触发，继续。"
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          elif [ "${KEEP_WARM}" = "on" ]; then
+            echo "KEEP_WARM=on，继续。"
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "KEEP_WARM 未开启，跳过。"
+            echo "run=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 唤醒 Space
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          SPACE_URL: ${{ vars.SPACE_URL }}
+        run: |
+          if [ -z "${SPACE_URL}" ]; then
+            echo "::error::没有设置仓库变量 SPACE_URL。"
+            exit 1
+          fi
+          # 冷启动可能要几十秒，给足超时并重试。
+          for attempt in 1 2 3; do
+            code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 300 \
+                     "${SPACE_URL%/}/api/health" || echo 000)
+            echo "第 ${attempt} 次：HTTP ${code}"
+            if [ "${code}" = "200" ]; then
+              echo "Space 已就绪。"
+              head -c 400 /tmp/body; echo
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::三次都没拿到 200，Space 可能正在构建或已出错。"
+          exit 1

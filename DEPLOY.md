@@ -216,6 +216,32 @@ https://smashing-a-stock.你的子域名.workers.dev
 
 ---
 
+## 让 Space 不休眠（不用买 CPU Upgrade）
+
+HF 文档：cpu-basic 的 Space 闲置 **48 小时**后休眠，而「任何访问都会自动重启它」。
+所以定时 ping 就能重置计时，不必买 $0.03/小时（约 **$22/月/个**）的 CPU Upgrade。
+
+仓库里的 `.github/workflows/keep-warm.yml` 就是干这个的，**出厂是关的**——
+定时任务第一步检查仓库变量 `KEEP_WARM`，不是 `on` 就秒退。
+
+在 GitHub 仓库 **Settings → Secrets and variables → Actions → Variables** 设两个：
+
+| 变量 | 值 |
+| --- | --- |
+| `SPACE_URL` | `https://你的用户名-smashing-a-stock-api.hf.space` |
+| `KEEP_WARM` | `on` 保持唤醒，`off`（或删掉）让它休眠 |
+
+日常：
+
+- **要分享链接了** → `KEEP_WARM` 设成 `on`，一次网页编辑，不用提交
+- **不用了** → 设成 `off`，workflow 留着空转
+- **现在就想叫醒** → Actions → *Keep Space warm* → **Run workflow**。手动触发无视
+  `KEEP_WARM`，关着也能用，适合发链接前一分钟点一下
+
+ping 频率不影响成本：只要成功阻止休眠，容器就是 24/7 常驻，6 小时和 40 小时一个样。
+间隔短只是留安全余量——GitHub 的定时任务是尽力而为，高负载时会延迟甚至跳过，
+而且公开仓库超过约 60 天没有活动，定时任务会被自动停用。
+
 ## 这套方案已知的代价
 
 **筹码成本拿不到。** `push2his.eastmoney.com` 从境外机器连不上，而它是筹码分布的唯一来源。
