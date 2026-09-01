@@ -101,26 +101,45 @@ git push
 
 ---
 
-### 第 4 步：把代码推到 Space
+### 第 4 步：把后端推到 Space
 
-Space 本身是一个 git 仓库，和 GitHub 那个是两个地方。给本地仓库加第二个远端：
+Space 是**另一个 git 仓库**，和 GitHub 那个不是一回事。先加远端：
 
 ```bash
 cd /Users/sylviadiathen/stock_tool
 git remote add space https://huggingface.co/spaces/你的用户名/smashing-a-stock-api
-git push space main
 ```
 
-推的时候会要用户名和密码：
+然后用脚本推：
+
+```bash
+bash scripts/push-space.sh
+```
+
+**不要用 `git push space main`。** 直接推整个仓库会被 HF 拒绝：
+
+```
+Your push was rejected because it contains binary files.
+Offending files:
+  - public/og.png
+```
+
+HF 要求二进制文件走 Xet/LFS。但 Space 只跑后端，压根用不到 `public/`——
+`Dockerfile` 只 COPY 了 `pyproject.toml`、`uv.lock` 和 `backend/`。
+所以脚本只打包这几个路径推上去（约 244 KB，无二进制），顺带让前端改动不再触发
+Space 重新构建。
+
+推的时候会要账号密码：
 
 - 用户名填你的 HF 用户名
 - **密码不是登录密码，是 Access Token**。去 <https://huggingface.co/settings/tokens> →
-  **Create new token** → 类型选 **Write** → 复制那串 `hf_...` 粘进去。
+  **Create new token** → 类型选 **Write** → 复制那串 `hf_...` 粘进去
 
-推完回到 Space 页面，会看到 **Building**。第一次构建要装 akshare 全套依赖，约 5–10 分钟。
-点 **Logs** 能看进度。看到 **Running** 就成了。
+推完回 Space 页面，会看到 **Building**。第一次要装 akshare 全套依赖，约 5–10 分钟，
+点 **Logs** 看进度。变成 **Running** 就成了。
 
----
+> **如果页面显示的是一个静态网页、没有 Building**：说明 Space 建成了 static 类型。
+> 检查仓库根目录 `README.md` 顶部的配置头里是不是 `sdk: docker`，改好重推一次。
 
 ### 第 5 步：确认后端活着
 
@@ -293,7 +312,7 @@ npm run lint && npm test && npm run test:api   # 三项都过再提交
 git add -A
 git commit -m "描述这次改了什么"
 git push          # GitHub
-git push space main   # Hugging Face Space，推完自动重新构建
+bash scripts/push-space.sh   # Hugging Face Space，推完自动重新构建
 ```
 
 只改了前端的话，还要重新发布一次前端：
