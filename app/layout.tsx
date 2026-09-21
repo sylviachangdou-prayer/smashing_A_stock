@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Analytics } from "./analytics";
 import { BASE_PATH, BRAND_MARK } from "./site";
 import "./globals.css";
 
@@ -32,7 +33,10 @@ export function generateMetadata(): Metadata {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body>
+        {children}
+        <Analytics />
+      </body>
     </html>
   );
 }

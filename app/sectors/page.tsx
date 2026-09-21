@@ -526,7 +526,10 @@ export default function SectorsPage() {
           板块行情按行业和概念整理最新市场快照，并保留数据提供方与抓取时间。科技、金融、消费、医药和能源等入口
           仅是板块名称关键词筛选，不构成官方行业分类或投资建议。
         </p>
-        <a href="https://github.com/sylviachangdou-prayer" target="_blank" rel="noreferrer">SylviaDou</a>
+        <span className="footer-by">
+          <a href="https://github.com/sylviachangdou-prayer" target="_blank" rel="noreferrer">SylviaDou</a>
+          <a href="mailto:sylvia.chang.dou@gmail.com">sylvia.chang.dou@gmail.com</a>
+        </span>
       </footer>
     </main>
   );

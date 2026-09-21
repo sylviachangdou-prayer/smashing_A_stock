@@ -77,8 +77,10 @@ test("keeps the header concise and exposes a separate evidence-backed methodolog
   assert.match(page, /href="\/methodology"[^>]*>方法/);
   assert.doesNotMatch(page, /methodology-section/);
   assert.doesNotMatch(page, /官方披露优先：官方原文为核验锚点/);
-  for (const exchange of ["上海证券交易所：主板、科创板", "深圳证券交易所：主板、创业板", "北京证券交易所"]) {
-    assert.match(page, new RegExp(`<li>${exchange}</li>`));
+  // 首页只留标题和搜索，覆盖范围改在方法页说明，不再占据首屏。
+  assert.doesNotMatch(page, /当前范围|hero-stat|hero-copy/);
+  for (const exchange of ["上海证券交易所", "深圳证券交易所", "北京证券交易所"]) {
+    assert.match(methodology, new RegExp(exchange));
   }
   assert.match(methodology, /href="\/"[^>]*>公司/);
   assert.match(methodology, /href="\/methodology"/);

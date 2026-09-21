@@ -81,3 +81,7 @@ npm run test:api
 - The cost basis is computed here from daily bars using the triangular chip-decay model Eastmoney publishes, the same algorithm its own page uses. When Eastmoney's historical quotes are unavailable, Tencent Securities daily bars are used instead and turnover is derived from the current tradable share count; the response carries a warning about that difference.
 
 This project uses no OpenAI API, includes no licensed commercial data, and is not investment advice.
+
+## License
+
+[MIT](LICENSE).

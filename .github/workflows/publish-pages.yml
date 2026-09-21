@@ -2,6 +2,7 @@
 #
 # 后端仍在 Hugging Face Space，页面在浏览器里直接调它，所以这里不需要任何服务端。
 # 仓库变量 API_BASE 可以覆盖后端地址；不设就用下面的默认值。
+# 仓库变量 GA_ID 是 Google Analytics 的衡量 ID（G- 开头）；不设就完全不加载统计。
 #
 # 首次使用需要在网页上点一次：
 #   Settings → Pages → Build and deployment → Source 选 "GitHub Actions"
@@ -44,6 +45,7 @@ jobs:
           NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
           NEXT_PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io
           NEXT_PUBLIC_API_BASE: ${{ vars.API_BASE || 'https://sylviachangdou-prayer-smashing-a-stock-api.hf.space' }}
+          NEXT_PUBLIC_GA_ID: ${{ vars.GA_ID }}
         run: |
           npx next build
           # _next 以下划线开头，不加这个文件 Jekyll 会把整个目录吃掉。

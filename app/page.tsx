@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import { track } from "./analytics";
 import { BRAND_MARK } from "./site";
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -740,9 +741,11 @@ export default function Home() {
         (company) => company.code.toLowerCase() === normalized || company.name.toLowerCase() === normalized,
       ) ?? matches[0];
       if (match) {
+        track("company_opened", { code: match.code, exchange: match.exchange, scope: searchScope });
         rememberCompany(match);
         void loadCompany(match);
       } else {
+        track("company_not_found", { scope: searchScope });
         setNotice(
           searchScope === "current"
             ? "未找到匹配的当前上市 A 股。"
@@ -900,18 +903,6 @@ export default function Home() {
       <section className="hero" id="top">
         <div>
           <h1>今天准能行。</h1>
-          <p className="hero-copy">
-            输入沪深北 A 股公司名称或六位代码。财务、股东、两融、合同公告与同业模块独立读取，单一上游失败不会阻塞整份报告。
-          </p>
-        </div>
-        <div className="hero-stat">
-          <span>当前范围</span>
-          <ul>
-            <li>上海证券交易所：主板、科创板</li>
-            <li>深圳证券交易所：主板、创业板</li>
-            <li>北京证券交易所</li>
-          </ul>
-          <p>支持公司概况、财务、股东、主营、两融、合同公告与同业比较。</p>
         </div>
       </section>
 
@@ -925,7 +916,7 @@ export default function Home() {
                 setQuery(event.target.value);
                 setSuggestions([]);
               }}
-              placeholder="公司名称或代码，如：贵州茅台 / 600519"
+              placeholder="公司名称或代码"
               aria-label="公司名称或股票代码"
             />
           </label>
@@ -2128,7 +2119,10 @@ export default function Home() {
           口径对齐，不对缺失项进行生成式补全；跨公司比较限于最近共同完整年度。因此，输出用于公开信息研究与
           审计追踪，不构成投资建议，结论应以原始披露为准。
         </p>
-        <a href="https://github.com/sylviachangdou-prayer" target="_blank" rel="noreferrer">SylviaDou</a>
+        <span className="footer-by">
+          <a href="https://github.com/sylviachangdou-prayer" target="_blank" rel="noreferrer">SylviaDou</a>
+          <a href="mailto:sylvia.chang.dou@gmail.com">sylvia.chang.dou@gmail.com</a>
+        </span>
       </footer>
     </main>
   );

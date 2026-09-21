@@ -101,11 +101,8 @@ a { color: inherit; text-decoration: none; }
 .hero {
   max-width: 1440px;
   margin: 0 auto;
-  padding: 72px clamp(24px, 7vw, 104px) 62px;
-  display: grid;
-  grid-template-columns: 1fr minmax(320px, 360px);
-  align-items: end;
-  gap: 64px;
+  padding: 56px clamp(24px, 7vw, 104px) 44px;
+  display: block;
   background:
     linear-gradient(#e7ece8 1px, transparent 1px),
     linear-gradient(90deg, #e7ece8 1px, transparent 1px);
@@ -121,19 +118,6 @@ a { color: inherit; text-decoration: none; }
   line-height: 1.14;
   letter-spacing: -.04em;
 }
-.hero-copy { max-width: 760px; margin: 24px 0 0; color: #526058; font-size: 18px; line-height: 1.9; }
-.hero-stat { padding: 20px 22px 22px; border-top: 3px solid var(--ink); border-bottom: 1px solid var(--line); background: rgba(251, 252, 250, .92); }
-.hero-stat > span { color: var(--muted); font-size: 14px; }
-.hero-stat ul { margin: 10px 0 0; padding: 0; list-style: none; }
-.hero-stat li {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--line);
-  font-family: "STSong", "Songti SC", serif;
-  font-size: 18px;
-  font-weight: 600;
-  line-height: 1.45;
-}
-.hero-stat p { margin: 12px 0 0; color: var(--muted); font-size: 14px; line-height: 1.75; }
 
 .search-panel {
   max-width: 1240px;
@@ -628,6 +612,57 @@ td, .quote-grid dd, .metric-grid strong { font-variant-numeric: tabular-nums; }
 .methodology-grid article + article { padding-left: 24px; border-left: 1px solid var(--line); }
 .methodology-grid h3 { margin: 0 0 12px; font-family: "STSong", serif; font-size: 24px; }
 .methodology-grid p { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.9; }
+.methodology-grid ul, .methodology-grid dl { margin: 0; padding: 0; }
+.method-lead { margin: 0 0 12px !important; }
+.method-list { list-style: none; display: grid; gap: 11px; }
+.method-list li {
+  position: relative;
+  padding-left: 15px;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.85;
+}
+.method-list li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: .78em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--green);
+  opacity: .45;
+}
+.method-list b { margin-right: 9px; color: var(--ink); font-weight: 700; }
+.method-list code {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--soft);
+  color: #3d4a43;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13.5px;
+}
+.method-key {
+  padding: 0 2px;
+  background: linear-gradient(transparent 62%, rgba(23, 107, 77, .18) 0);
+  color: var(--ink);
+  font-style: normal;
+  font-weight: 600;
+}
+.window-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(146px, 1fr));
+  gap: 1px;
+  margin: 0 0 16px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+.window-grid > div { padding: 9px 12px 10px; background: var(--paper); }
+.window-grid dt { color: var(--muted); font-size: 12.5px; letter-spacing: .02em; }
+.window-grid dd { margin: 3px 0 0; color: var(--ink); font-size: 15px; font-weight: 600; }
+.source-list li { line-height: 2.1; }
+.source-list a { color: var(--green); text-decoration: underline; text-underline-offset: 3px; }
+
 .methodology-table { margin-top: 28px; border: 1px solid var(--line); background: white; }
 .methodology-text-sections { margin-top: 28px; border-top: 1px solid var(--line); }
 .methodology-text-sections p { color: #46524b; font-size: 16px; line-height: 1.95; }
@@ -646,11 +681,11 @@ footer {
 }
 footer p { max-width: 980px; margin: 0; line-height: 1.75; }
 footer a { flex: 0 0 auto; font-weight: 700; }
+.footer-by { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.footer-by a:last-child { font-weight: 400; font-size: 13px; color: var(--muted); text-decoration: underline; text-underline-offset: 3px; }
 
 @media (max-width: 900px) {
   .topbar { gap: 24px; }
-  .hero { grid-template-columns: 1fr; gap: 30px; }
-  .hero-stat { max-width: 480px; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .profile-grid { grid-template-columns: repeat(2, 1fr); }
   .module-status { grid-template-columns: repeat(2, 1fr); }
