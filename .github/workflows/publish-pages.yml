@@ -35,7 +35,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-      - run: npm ci
+      # 不用 npm ci：@rolldown 和 @tailwindcss 的 wasm 可选依赖在 macOS 与 Linux 上
+      # 解析出的树不同，在哪台机器上生成 lock，另一台的 npm ci 就会报缺包。
+      - run: npm install --no-audit --no-fund
       - name: 导出静态站
         env:
           STATIC_EXPORT: "1"
