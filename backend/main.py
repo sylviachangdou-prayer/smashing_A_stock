@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock, Thread
+from threading import BoundedSemaphore, Lock, Thread
 from typing import Any, Callable, Literal
 
 import akshare as ak
@@ -36,6 +36,10 @@ EASTMONEY_DATACENTER = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 THS_F10 = "https://basic.10jqka.com.cn/new"
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ = timezone(timedelta(hours=8))
+EXCHANGE_GATES: dict[str, BoundedSemaphore] = {}
+EXCHANGE_GATE_GUARD = Lock()
+EXCHANGE_CONCURRENCY = 3
+EXCHANGE_RETRY_WAITS = (0, 2, 6)
 CNINFO_JS_LOCK = Lock()
 CNINFO_QUERY_LOCK = Lock()
 CACHE_LOCKS: dict[str, Lock] = {}
@@ -235,6 +239,22 @@ def cached(key: str, ttl_seconds: int, loader: Callable[[], Any], refresh: bool 
         return value
 
 
+def exchange_call(exchange: str, loader: Callable[[], Any]) -> Any:
+    """交易所官网按来源 IP 限速，突发请求会被回以 403。限并发并退避重试。"""
+    with EXCHANGE_GATE_GUARD:
+        gate = EXCHANGE_GATES.setdefault(exchange, BoundedSemaphore(EXCHANGE_CONCURRENCY))
+    failure: Exception = RuntimeError(f"{exchange} 未发起请求")
+    with gate:
+        for wait in EXCHANGE_RETRY_WAITS:
+            if wait:
+                time.sleep(wait)
+            try:
+                return loader()
+            except Exception as exc:
+                failure = exc
+    raise failure
+
+
 def frame_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
@@ -359,6 +379,10 @@ def master_source(source_id: str) -> dict[str, Any]:
 
 
 def szse_a_share_list() -> list[dict[str, Any]]:
+    return exchange_call("SZSE", _szse_a_share_list)
+
+
+def _szse_a_share_list() -> list[dict[str, Any]]:
     session = requests.Session()
     session.mount("https://www.szse.cn", TLS12Adapter())
     response_value = session.get(
@@ -526,8 +550,8 @@ def eastmoney_code_list() -> list[dict[str, Any]]:
 
 def sse_a_share_list() -> list[dict[str, Any]]:
     """上交所主板与科创板股票列表。响应接近两兆，用比全局默认更长的超时。"""
-    rows: list[dict[str, Any]] = []
-    for stock_type in ("1", "8"):
+
+    def load(stock_type: str) -> list[dict[str, Any]]:
         payload = requests.get(
             SSE_STOCK_LIST,
             params={
@@ -553,45 +577,56 @@ def sse_a_share_list() -> list[dict[str, Any]]:
             timeout=90,
         )
         payload.raise_for_status()
-        for item in (payload.json() or {}).get("result") or []:
-            code = str(item.get("A_STOCK_CODE") or "").strip()
-            if code:
-                rows.append({"证券代码": code, "证券简称": str(item.get("SEC_NAME_CN") or "").strip()})
+        return [
+            {"证券代码": code, "证券简称": str(item.get("SEC_NAME_CN") or "").strip()}
+            for item in (payload.json() or {}).get("result") or []
+            if (code := str(item.get("A_STOCK_CODE") or "").strip())
+        ]
+
+    rows: list[dict[str, Any]] = []
+    for stock_type in ("1", "8"):
+        rows += exchange_call("SSE", lambda: load(stock_type))
     return rows
 
 
-MasterLoaders = tuple[tuple[Callable[[], list[dict[str, Any]]], str], ...]
-
-
-def _load_master_batches(loaders: MasterLoaders) -> list[tuple[list[dict[str, Any]], str]]:
+def _load_master_batches(
+    loaders: MasterLoaders, failures: dict[str, str]
+) -> list[tuple[list[dict[str, Any]], str]]:
     batches: list[tuple[list[dict[str, Any]], str]] = []
     with ThreadPoolExecutor(max_workers=len(loaders)) as pool:
         futures = {pool.submit(loader): source_id for loader, source_id in loaders}
         for future in as_completed(futures):
+            source_id = futures[future]
             try:
                 rows = future.result()
-            except Exception:
+            except Exception as exc:
+                failures[source_id] = f"{type(exc).__name__}: {exc}"[:160]
                 continue
             if rows:
-                batches.append((rows, futures[future]))
+                batches.append((rows, source_id))
+            else:
+                failures[source_id] = "响应为空"
     return batches
 
 
 def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
     with STOCK_MASTER_REFRESH_LOCK:
+        failures: dict[str, str] = {}
         batches = _load_master_batches(
             (
                 (sse_a_share_list, "sse-stock-list"),
                 (szse_a_share_list, "szse-stock-list"),
                 (lambda: frame_records(ak.stock_info_bj_name_code()), "bse-stock-list"),
-            )
+            ),
+            failures,
         )
         if not set(MASTER_OFFICIAL_SOURCE.values()) <= {source_id for _, source_id in batches}:
             batches += _load_master_batches(
                 (
                     (eastmoney_code_list, "eastmoney-stock-list"),
                     (lambda: frame_records(ak.stock_zh_a_spot()), "sina-stock-list"),
-                )
+                ),
+                failures,
             )
 
         successful = {source_id for _, source_id in batches}
@@ -607,6 +642,7 @@ def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
             cache_file("stock_master_meta"),
             {
                 "refreshed_at": now_iso(),
+                "source_failures": {k: v for k, v in failures.items() if k not in successful},
                 "official_sources": sorted(official_sources),
                 "secondary_sources": sorted(successful & {"eastmoney-stock-list", "sina-stock-list"}),
                 "stale_fallback_exchanges": sorted(
@@ -1626,13 +1662,18 @@ def overview(raw_code: str, refresh: bool = False, mode: SourceMode = "official"
 
 
 def margin_rows_for_date(exchange: str, trade_date: str) -> list[dict[str, Any]]:
-    if exchange == "SSE":
-        rows = frame_records(ak.stock_margin_detail_sse(date=trade_date))
-    elif exchange == "SZSE":
-        rows = frame_records(ak.stock_margin_detail_szse(date=trade_date))
-    else:
+    if exchange not in ("SSE", "SZSE"):
         return []
-    return rows
+    fetch = ak.stock_margin_detail_sse if exchange == "SSE" else ak.stock_margin_detail_szse
+
+    def load() -> list[dict[str, Any]]:
+        try:
+            return frame_records(fetch(date=trade_date))
+        except ValueError:
+            # 非交易日或明细尚未发布时上游返回空表，套列名时抛错，按无数据处理。
+            return []
+
+    return exchange_call(exchange, load)
 
 
 def margin_item(code: str, row: dict[str, Any], trade_date: str, source_id: str) -> dict[str, Any]:
@@ -1698,16 +1739,14 @@ def capital(
         ]
         return day, rows
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(fetch, day): day for day in candidates}
-        for future in as_completed(futures):
-            day = futures[future]
-            try:
-                _, rows = future.result()
+    # 交易所限速，按最近的日子分批取，够 days 天就停，不必把整个候选窗口抓完。
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for index in range(0, len(candidates), 4):
+            for day, rows in pool.map(fetch, candidates[index : index + 4]):
                 if rows:
                     found.append((day, rows[0]))
-            except Exception:
-                continue
+            if len(found) >= days:
+                break
     prune_margin_cache()
     found.sort(key=lambda item: item[0], reverse=True)
     found = found[:days]
@@ -2210,27 +2249,30 @@ def eastmoney_disclosure(code: str, start: date) -> list[dict[str, Any]]:
 
 
 def szse_disclosure(code: str, start: date) -> list[dict[str, Any]]:
+    def load(channel: str, page: int) -> list[dict[str, Any]]:
+        payload = requests.post(
+            SZSE_ANN_LIST,
+            json={
+                "seDate": [start.isoformat(), date.today().isoformat()],
+                "stock": [code],
+                "channelCode": [channel],
+                "pageSize": 50,
+                "pageNum": page,
+            },
+            headers={
+                **BROWSER_HEADERS,
+                "Content-Type": "application/json",
+                "Referer": "https://www.szse.cn/disclosure/listed/notice/index.html",
+            },
+            timeout=25,
+        )
+        payload.raise_for_status()
+        return (payload.json() or {}).get("data") or []
+
     rows: list[dict[str, Any]] = []
     for channel in ("fixed_disc", "listedNotice_disc"):
         for page in range(1, 11):
-            payload = requests.post(
-                SZSE_ANN_LIST,
-                json={
-                    "seDate": [start.isoformat(), date.today().isoformat()],
-                    "stock": [code],
-                    "channelCode": [channel],
-                    "pageSize": 50,
-                    "pageNum": page,
-                },
-                headers={
-                    **BROWSER_HEADERS,
-                    "Content-Type": "application/json",
-                    "Referer": "https://www.szse.cn/disclosure/listed/notice/index.html",
-                },
-                timeout=25,
-            )
-            payload.raise_for_status()
-            items = (payload.json() or {}).get("data") or []
+            items = exchange_call("SZSE", lambda: load(channel, page))
             if not items:
                 break
             for item in items:
@@ -2248,8 +2290,7 @@ def szse_disclosure(code: str, start: date) -> list[dict[str, Any]]:
 
 
 def sse_disclosure(code: str, start: date) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for page in range(1, 11):
+    def load(page: int) -> list[dict[str, Any]]:
         payload = requests.get(
             SSE_ANN_LIST,
             params={
@@ -2274,7 +2315,11 @@ def sse_disclosure(code: str, start: date) -> list[dict[str, Any]]:
         payload.raise_for_status()
         wrapper = re.search(r"jsonpCallback\((.*)\)\s*$", payload.text, re.S)
         grouped = json.loads(wrapper.group(1) if wrapper else payload.text)["pageHelp"]["data"]
-        items = [row for group in grouped for row in (group if isinstance(group, list) else [group])]
+        return [row for group in grouped for row in (group if isinstance(group, list) else [group])]
+
+    rows: list[dict[str, Any]] = []
+    for page in range(1, 11):
+        items = exchange_call("SSE", lambda: load(page))
         if not items:
             break
         for item in items:
@@ -3589,7 +3634,7 @@ def sse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
         rows = value.json().get("result") or []
         return rows[0] if rows else {}
 
-    return cached(f"sse_company_{code}", 24 * 3600, load, refresh)
+    return cached(f"sse_company_{code}", 24 * 3600, lambda: exchange_call("SSE", load), refresh)
 
 
 def szse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
@@ -3604,7 +3649,7 @@ def szse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
         payload = value.json()
         return {**(payload.get("data") or {}), "plate": payload.get("plate")}
 
-    return cached(f"szse_company_{code}", 24 * 3600, load, refresh)
+    return cached(f"szse_company_{code}", 24 * 3600, lambda: exchange_call("SZSE", load), refresh)
 
 
 def bse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
@@ -3628,7 +3673,7 @@ def bse_company_record(code: str, refresh: bool = False) -> dict[str, Any]:
         rows = (payload[0] or {}).get("content") or []
         return rows[0] if rows else {}
 
-    return cached(f"bse_company_{code}", 24 * 3600, load, refresh)
+    return cached(f"bse_company_{code}", 24 * 3600, lambda: exchange_call("BSE", load), refresh)
 
 
 EXCHANGE_FIELD_MAP = {
