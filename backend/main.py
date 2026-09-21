@@ -475,11 +475,49 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+SSE_STOCK_LIST = "https://query.sse.com.cn/sseQuery/commonQuery.do"
+
+
+def sse_a_share_list() -> list[dict[str, Any]]:
+    """上交所主板与科创板股票列表。响应接近两兆，用比全局默认更长的超时。"""
+    rows: list[dict[str, Any]] = []
+    for stock_type in ("1", "8"):
+        payload = requests.get(
+            SSE_STOCK_LIST,
+            params={
+                "STOCK_TYPE": stock_type,
+                "REG_PROVINCE": "",
+                "CSRC_CODE": "",
+                "STOCK_CODE": "",
+                "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L",
+                "COMPANY_STATUS": "2,4,5,7,8",
+                "type": "inParams",
+                "isPagination": "true",
+                "pageHelp.cacheSize": "1",
+                "pageHelp.beginPage": "1",
+                "pageHelp.pageSize": "10000",
+                "pageHelp.pageNo": "1",
+                "pageHelp.endPage": "1",
+            },
+            headers={
+                **BROWSER_HEADERS,
+                "Host": "query.sse.com.cn",
+                "Referer": "https://www.sse.com.cn/assortment/stock/list/share/",
+            },
+            timeout=90,
+        )
+        payload.raise_for_status()
+        for item in (payload.json() or {}).get("result") or []:
+            code = str(item.get("A_STOCK_CODE") or "").strip()
+            if code:
+                rows.append({"证券代码": code, "证券简称": str(item.get("SEC_NAME_CN") or "").strip()})
+    return rows
+
+
 def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
     with STOCK_MASTER_REFRESH_LOCK:
         official_loaders = (
-            (lambda: frame_records(ak.stock_info_sh_name_code(symbol="主板A股")), "sse-stock-list"),
-            (lambda: frame_records(ak.stock_info_sh_name_code(symbol="科创板")), "sse-stock-list"),
+            (sse_a_share_list, "sse-stock-list"),
             (szse_a_share_list, "szse-stock-list"),
             (lambda: frame_records(ak.stock_info_bj_name_code()), "bse-stock-list"),
         )
@@ -673,10 +711,12 @@ def stock_master_audit(items: list[dict[str, str]]) -> dict[str, Any]:
 def lookup_company(code: str, refresh: bool = False) -> dict[str, str]:
     company = next((item for item in stock_master(refresh) if item["code"] == code), None)
     if not company:
-        company = next(
-            (item for item in extended_company_master(refresh) if item["code"] == code),
-            None,
-        )
+        # 巨潮历史公司表不可用时按“查不到”处理，否则上游异常会直接冒成 500。
+        try:
+            extended = extended_company_master(refresh)
+        except Exception:
+            extended = []
+        company = next((item for item in extended if item["code"] == code), None)
     if not company:
         raise ValueError(f"未在当前 A 股或巨潮历史公司列表中找到 {code}")
     return company
