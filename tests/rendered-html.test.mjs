@@ -7,6 +7,7 @@ const sectorsPageUrl = new URL("../app/sectors/page.tsx", import.meta.url);
 const methodologyPageUrl = new URL("../app/methodology/page.tsx", import.meta.url);
 const backendUrl = new URL("../backend/main.py", import.meta.url);
 const layoutUrl = new URL("../app/layout.tsx", import.meta.url);
+const siteUrl = new URL("../app/site.ts", import.meta.url);
 const stylesUrl = new URL("../app/globals.css", import.meta.url);
 const methodologyEvidenceUrl = new URL("../docs/methodology_evidence.md", import.meta.url);
 
@@ -86,7 +87,9 @@ test("keeps the header concise and exposes a separate evidence-backed methodolog
   assert.match(methodology, /<h3>局限<\/h3>/);
   assert.match(methodology, /<h3>公开来源<\/h3>/);
   assert.match(methodology, /https:\/\/github\.com\/sylviachangdou-prayer/);
-  assert.match(layout, /niu-oracle\.svg/g);
+  // 站点图标经 app/site.ts 统一补上 basePath，GitHub Pages 的子路径才不会 404。
+  assert.match(layout, /BRAND_MARK/g);
+  assert.match(await readFile(siteUrl, "utf8"), /niu-oracle\.svg/g);
   assert.match(evidence, /Coverage audit recorded/);
 });
 

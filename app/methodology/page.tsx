@@ -1,4 +1,5 @@
 import Image from "next/image";
+import { BRAND_MARK } from "../site";
 import Link from "next/link";
 
 export default function MethodologyPage() {
@@ -6,7 +7,7 @@ export default function MethodologyPage() {
     <main>
       <header className="topbar">
         <Link className="brand" href="/">
-          <span className="brand-mark"><Image src="/niu-oracle.svg" alt="甲骨文牛字" width={28} height={28} /></span>
+          <span className="brand-mark"><Image src={BRAND_MARK} alt="甲骨文牛字" width={28} height={28} /></span>
           <span><b>A股公司研究台</b></span>
         </Link>
         <nav aria-label="主要导航">

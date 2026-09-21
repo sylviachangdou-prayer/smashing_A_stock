@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import { BRAND_MARK } from "./site";
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
@@ -873,7 +874,7 @@ export default function Home() {
     <main>
       <header className="topbar">
         <Link className="brand" href="/">
-          <span className="brand-mark"><Image src="/niu-oracle.svg" alt="甲骨文牛字" width={28} height={28} /></span>
+          <span className="brand-mark"><Image src={BRAND_MARK} alt="甲骨文牛字" width={28} height={28} /></span>
           <span><b>A股公司研究台</b></span>
         </Link>
         <nav aria-label="主要导航">
@@ -1165,18 +1166,18 @@ export default function Home() {
                   <div className="panel-title"><div><h3>主要业务与基本信息</h3></div></div>
                   {profile.main_business && <p className="business-copy">{String(profile.main_business.value)}</p>}
                   <dl className="profile-grid">
-                    {[
+                    {([
                       ["公司全称", profile.company_name],
                       ["所属行业", profile.industry],
                       ["法定代表人", profile.legal_representative],
                       ["注册资本", profile.registered_capital],
                       ["上市日期", profile.listing_date],
                       ["办公地址", profile.office_address],
-                    ].map(([label, item]) => item && (
-                      <div key={String(label)}>
+                    ] as [string, Sourced | undefined][]).map(([label, item]) => item && (
+                      <div key={label}>
                         <dt>{label}</dt>
-                        <dd>{String((item as Sourced).value)}</dd>
-                        <SourceLink sourceId={(item as Sourced).source_id} sources={sources} compact />
+                        <dd>{String(item.value)}</dd>
+                        <SourceLink sourceId={item.source_id} sources={sources} compact />
                       </div>
                     ))}
                   </dl>

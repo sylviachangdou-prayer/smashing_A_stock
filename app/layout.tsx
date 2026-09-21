@@ -1,20 +1,19 @@
 import type { Metadata } from "next";
-import { headers } from "next/headers";
+import { BASE_PATH, BRAND_MARK } from "./site";
 import "./globals.css";
 
-export async function generateMetadata(): Promise<Metadata> {
-  const requestHeaders = await headers();
-  const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host") ?? "localhost:3000";
-  const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
-  const ogImage = `${protocol}://${host}/og.png`;
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+
+export function generateMetadata(): Metadata {
+  const ogImage = `${SITE_URL}${BASE_PATH}/og.png`;
 
   return {
     title: "A股公司研究台｜官方披露驱动的公司研究",
     description: "输入A股公司名称或代码，研究股东、财务、资金面、主营业务、同业竞争与重大合同，并回溯官方来源。",
     icons: {
-      icon: "/niu-oracle.svg",
-      shortcut: "/niu-oracle.svg",
-      apple: "/niu-oracle.svg",
+      icon: BRAND_MARK,
+      shortcut: BRAND_MARK,
+      apple: BRAND_MARK,
     },
     openGraph: {
       title: "A股公司研究台",

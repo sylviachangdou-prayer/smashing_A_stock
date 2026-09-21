@@ -1,0 +1,61 @@
+# 把前端导出成纯静态站发到 GitHub Pages。
+#
+# 后端仍在 Hugging Face Space，页面在浏览器里直接调它，所以这里不需要任何服务端。
+# 仓库变量 API_BASE 可以覆盖后端地址；不设就用下面的默认值。
+#
+# 首次使用需要在网页上点一次：
+#   Settings → Pages → Build and deployment → Source 选 "GitHub Actions"
+
+name: Publish site to Pages
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "backend/**"
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: 导出静态站
+        env:
+          STATIC_EXPORT: "1"
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+          NEXT_PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io
+          NEXT_PUBLIC_API_BASE: ${{ vars.API_BASE || 'https://sylviachangdou-prayer-smashing-a-stock-api.hf.space' }}
+        run: |
+          npx next build
+          # _next 以下划线开头，不加这个文件 Jekyll 会把整个目录吃掉。
+          touch out/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
