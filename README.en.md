@@ -32,6 +32,7 @@ The first run installs Python dependencies from `uv.lock`. The cache keeps at mo
 - `GET /api/company/{code}/overview`
 - `GET /api/company/{code}/quote`
 - `GET /api/company/{code}/logo` — redirects to the favicon of the company's own website
+- `GET /api/company/{code}/candles?days=120` — unadjusted daily open/high/low/close, volume and turnover, from the same bars the cost basis is computed from
 - `GET /api/company/{code}/capital?days=20`
 - `GET /api/company/{code}/contracts?months=24`
 - `GET /api/company/{code}/peers`

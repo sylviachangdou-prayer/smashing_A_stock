@@ -6,7 +6,7 @@
 
 | | 技术栈 | 能不能上 Serverless |
 |---|---|---|
-| 前端 `app/` | Next.js（vinext 构建成 Cloudflare Worker + 静态资源） | 可以 |
+| 前端 `app/` | Next.js，`next build` 导出为纯静态站 | 可以 |
 | 后端 `backend/` | Python FastAPI + akshare + pandas + pypdf | **不行** |
 
 前端只是壳。`app/page.tsx` 里所有数据都来自 `NEXT_PUBLIC_API_BASE`，默认 `http://127.0.0.1:8010`。
@@ -40,9 +40,10 @@
 
 所以后端最低配是 **512 MB 内存**，1 GB 舒服；磁盘留 5–10 GB 给缓存。
 
-## 选定方案：后端 Hugging Face Space + 前端 Cloudflare Workers
+## 选定方案：后端 Hugging Face Space + 前端 GitHub Pages
 
-两边都免费、网址固定、不依赖你的电脑开着。已知代价写在最后。
+两边都免费、网址固定、不依赖你的电脑开着。前端是纯静态导出，数据全部由浏览器
+直接调后端。已知代价写在最后。
 
 ---
 
@@ -154,63 +155,51 @@ https://你的用户名-smashing-a-stock-api.hf.space/api/health
 
 ---
 
-### 第 6 步：授权 Cloudflare
+### 第 6 步：打开 GitHub Pages
 
-你已经注册过了，只需要让命令行拿到授权：
+仓库 → **Settings** → **Pages** → **Build and deployment** → Source 选 **GitHub Actions**。
 
-```bash
-cd ~/stock_tool
-npx wrangler login
-```
-
-浏览器会弹出授权页，点 **Allow**。
+只需要点这一次。仓库必须是公开的，否则免费版用不了 Pages。
 
 ---
 
-### 第 7 步：发布前端
+### 第 7 步：告诉前端后端在哪
 
-用上一步的后端地址：
+仓库 → **Settings** → **Secrets and variables** → **Actions** → **Variables** 标签 → **New variable**：
 
-```bash
-bash scripts/deploy-web.sh https://你的用户名-smashing-a-stock-api.hf.space
-```
-
-脚本会先检查登录状态，再把后端地址烤进前端构建，然后发布。跑完会打印出网址，形如：
-
-```
-https://smashing-a-stock.你的子域名.workers.dev
-```
-
-如果这是你第一次用 Workers，它会在终端里让你挑一个 workers.dev 子域名，挑完就继续。
+| Name | Value | 必需 |
+| --- | --- | --- |
+| `API_BASE` | `https://你的用户名-smashing-a-stock-api.hf.space` | 否，不设就用工作流里的默认值 |
+| `GA_ID` | Google Analytics 的 `G-` 开头衡量 ID | 否，不设就完全不加载统计 |
 
 ---
 
-### 第 8 步：回到 Space 打开跨域白名单
+### 第 8 步：触发一次发布
 
-后端默认只允许 `localhost:3000`，现在要让它接受来自正式网址的请求。
+推任何改动到 `main` 就会自动发布。想立刻跑一次：
 
-1. 打开 Space → **Settings** → 找到 **Variables and secrets**
-2. **New variable**（注意是 variable，不是 secret），填：
+仓库 → **Actions** → **Publish site to Pages** → **Run workflow**。
 
-   | Name | Value |
-   | --- | --- |
-   | `ALLOWED_ORIGINS` | `https://smashing-a-stock.你的子域名.workers.dev` |
+约一分半钟，完成后网址是：
 
-3. 保存后 Space 会自动重启，约一分钟。
+```
+https://你的用户名.github.io/仓库名/
+```
 
-**不做这步的话**：网页能打开，但所有模块都会失败，浏览器控制台里全是 CORS 报错。
+**跨域不用配。** Hugging Face 的网关会对任意来源回显 `Access-Control-Allow-Origin`，
+所以后端的 `ALLOWED_ORIGINS` 在这套部署里不起作用，也不需要设。
 
 ---
 
 ### 第 9 步：验收
 
-打开你的 workers.dev 网址，查一家公司，重点看页面顶部的模块条：
+打开网址，查一家公司，重点看页面顶部的模块条：
 
 | 模块 | 预期 |
 | --- | --- |
-| 实时行情、公司总览、基本情况、报告期财务 | 完整 / 部分 |
+| 实时行情、日线走势、公司总览、基本情况、报告期财务 | 完整 / 部分 |
 | 机构持股、公募与私募、调研与研报、舆情、交易所登记 | 完整 / 部分 |
-| 资金与筹码 | **部分**——资金流会降级到新浪口径，筹码成本显示「未取得」 |
+| 资金与筹码 | 完整 / 部分——东财不可用时会降级到新浪与腾讯口径，页面会标注 |
 
 模块条就是诊断工具。哪个显示「失败」，点开对应区块，底部「取数状态与来源」里有具体原因。
 
@@ -273,7 +262,12 @@ ping 频率不影响成本：只要成功阻止休眠，容器就是 24/7 常驻
 | 筹码模块 | ✅ | ✅ | **❌** | 看选址 |
 | 缓存持久 | ✅ | ✅ | **❌** | ✅ |
 
-选 HF 是因为「随时可访问」这一条压倒了筹码那一个模块。
+选 HF 是因为「随时可访问」这一条压倒了其他考虑。
+
+前端最初发到 Cloudflare Workers，但该账号被 Cloudflare 风控禁止注册 workers.dev
+子域名（面板提示 `You cannot register a workers.dev subdomain`），Worker 部署得上去
+却拿不到网址。改成纯静态导出发 GitHub Pages 之后，整套 Cloudflare 工具链
+（vinext、vite、wrangler 等七个依赖）都不再需要，已从仓库移除。
 
 ---
 
@@ -288,13 +282,13 @@ npm run local
 
 零成本、所有模块都通、缓存持久，缺点是只有你自己能用。
 
-## 关于 GitHub Pages
+## 为什么前端能放进 GitHub Pages
 
-`用户名.github.io/项目名` 这类地址是 GitHub Pages：免费、能绑自定义域名、但**只放静态文件，跑不了任何服务端程序**。
+Pages 只放静态文件，跑不了服务端程序。这个项目正好合适：两个主页面都是
+`"use client"`，唯一的服务端依赖是 `app/layout.tsx` 里用 `headers()` 拼 OG 图地址，
+换成构建期变量后整站可以静态导出，数据全部由浏览器直接调 HF 后端。
 
-对这个项目：前端理论上能放上去（要先把 `app/layout.tsx` 里的 `headers()` 换成固定 URL，那是唯一用到服务端 API 的地方），但**后端永远放不进去**——没有 Python 运行时，也不能对外发请求。所以 Pages 只能解决"页面能打开"，解决不了"页面里有数据"。
-
-既然 Cloudflare Workers 同样免费、这个项目本来就构建成 Worker、而且不用改代码，没必要绕 Pages 这一圈。
+后端放不进 Pages——没有 Python 运行时，也不能对外发请求——所以它留在 HF Space。
 
 ## 环境变量一览
 
@@ -312,7 +306,9 @@ npm run local
 
 | 变量 | 作用 |
 | --- | --- |
-| `NEXT_PUBLIC_API_BASE` | 后端地址。改了必须重新 `npm run build` 才生效，`scripts/deploy-web.sh` 已经包含这一步 |
+| `NEXT_PUBLIC_API_BASE` | 后端地址，构建期烤进前端。线上由工作流从仓库变量 `API_BASE` 注入 |
+| `NEXT_PUBLIC_BASE_PATH` | Pages 的仓库子路径，例如 `/smashing_A_stock`。本地开发留空 |
+| `NEXT_PUBLIC_GA_ID` | Google Analytics 衡量 ID，不设就不加载统计 |
 
 ## 缓存上限
 
@@ -341,11 +337,8 @@ git push          # GitHub
 bash scripts/push-space.sh   # Hugging Face Space，推完自动重新构建
 ```
 
-只改了前端的话，还要重新发布一次前端：
-
-```bash
-bash scripts/deploy-web.sh https://你的用户名-smashing-a-stock-api.hf.space
-```
+前端不用单独发布——推到 `main` 之后 Pages 工作流会自动重新导出并上线。
+只改了后端（`backend/` 下的文件）时，Pages 不会重跑，只需要推 Space。
 
 
 日常改动：

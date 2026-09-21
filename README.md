@@ -43,6 +43,7 @@ npm run local
 - `GET /api/company/{code}/overview`
 - `GET /api/company/{code}/quote`
 - `GET /api/company/{code}/logo` — 重定向到公司官网域名的站点图标
+- `GET /api/company/{code}/candles?days=120` — 不复权日线开高低收、成交量与换手率，与筹码成本同源
 - `GET /api/company/{code}/capital?days=20`
 - `GET /api/company/{code}/contracts?months=24`
 - `GET /api/company/{code}/peers`
