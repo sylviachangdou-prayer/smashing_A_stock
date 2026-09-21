@@ -9,9 +9,14 @@ pinned: false
 license: mit
 ---
 
-# A股公司研究台（本地试用版）
+**中文** · [English](README.en.md)
+
+# A股公司研究台
 
 按公司名称或六位代码查询沪深北 A 股公开信息。前端只渲染实际取得且带 `source_id` 的数据；上游缺失或超时会按模块单独显示，不生成替代值。
+
+- 页面：<https://sylviachangdou-prayer.github.io/smashing_A_stock/>
+- 数据服务：<https://sylviachangdou-prayer-smashing-a-stock-api.hf.space>
 
 ## 本地启动
 
@@ -32,10 +37,12 @@ npm run local
 ## 接口
 
 - `GET /api/search?q=`
+- `GET /api/market-brief` — 全球财经头条，缓存六小时
 - `GET /api/sectors?kind=industry|concept`
 - `GET /api/sectors/{kind}/{board_name}?board_code=`
 - `GET /api/company/{code}/overview`
 - `GET /api/company/{code}/quote`
+- `GET /api/company/{code}/logo` — 重定向到公司官网域名的站点图标
 - `GET /api/company/{code}/capital?days=20`
 - `GET /api/company/{code}/contracts?months=24`
 - `GET /api/company/{code}/peers`
@@ -63,7 +70,7 @@ npm run local
 
 ## 发布与更新
 
-部署方式、服务器选址的注意事项与版本更新流程见 [DEPLOY.md](DEPLOY.md)。
+前端是静态导出，发布在 GitHub Pages；后端是 Hugging Face 上的 Docker Space。部署步骤与版本更新流程见 [DEPLOY.md](DEPLOY.md)。
 
 ## 验证
 

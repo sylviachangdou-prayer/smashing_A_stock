@@ -51,7 +51,7 @@
 部署前先在本机跑一遍，确认代码本身没问题：
 
 ```bash
-cd /Users/sylviadiathen/stock_tool
+cd ~/stock_tool
 npm run local
 ```
 
@@ -64,7 +64,7 @@ npm run local
 Space 要从你的仓库拉代码，先确保 GitHub 上是最新的：
 
 ```bash
-cd /Users/sylviadiathen/stock_tool
+cd ~/stock_tool
 git add -A
 git commit -m "Add Hugging Face Space container"
 git push
@@ -106,7 +106,7 @@ git push
 Space 是**另一个 git 仓库**，和 GitHub 那个不是一回事。先加远端：
 
 ```bash
-cd /Users/sylviadiathen/stock_tool
+cd ~/stock_tool
 git remote add space https://huggingface.co/spaces/你的用户名/smashing-a-stock-api
 ```
 
@@ -159,7 +159,7 @@ https://你的用户名-smashing-a-stock-api.hf.space/api/health
 你已经注册过了，只需要让命令行拿到授权：
 
 ```bash
-cd /Users/sylviadiathen/stock_tool
+cd ~/stock_tool
 npx wrangler login
 ```
 

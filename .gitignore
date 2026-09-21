@@ -46,3 +46,11 @@ __pycache__/
 !.env.example
 out/
 tsconfig.tsbuildinfo
+
+# local toolchain
+/.venv/
+/.uv/
+*.log
+.idea/
+.vscode/
+*.swp

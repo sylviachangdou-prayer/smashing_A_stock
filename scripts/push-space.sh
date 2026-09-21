@@ -26,7 +26,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # Dockerfile 只用到这几个路径。
-paths=(Dockerfile README.md pyproject.toml uv.lock backend)
+paths=(Dockerfile README.md README.en.md pyproject.toml uv.lock backend)
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
