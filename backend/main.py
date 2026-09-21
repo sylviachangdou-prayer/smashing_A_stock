@@ -3192,15 +3192,22 @@ def chip_cost_records(code: str, market: str) -> list[dict[str, Any]]:
 
 def sina_money_flow(code: str, days: int, source_id: str, refresh: bool = False) -> list[dict[str, Any]]:
     def load() -> list[dict[str, Any]]:
-        value = requests.get(
-            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs",
-            params={"page": "1", "num": "60", "sort": "opendate", "asc": "0", "daima": market_symbol(code, lower=True)},
-            headers={**BROWSER_HEADERS, "Referer": "https://finance.sina.com.cn/"},
-            timeout=20,
-        )
-        value.raise_for_status()
-        rows = value.json()
-        return rows if isinstance(rows, list) else []
+        # 新浪对 https 的资金流服务返回 456；代码表走的 http 同路径前缀则正常，两个都试。
+        failures: list[str] = []
+        for scheme in ("http", "https"):
+            try:
+                value = requests.get(
+                    f"{scheme}://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs",
+                    params={"page": "1", "num": "60", "sort": "opendate", "asc": "0", "daima": market_symbol(code, lower=True)},
+                    headers={**BROWSER_HEADERS, "Referer": "http://finance.sina.com.cn/"},
+                    timeout=20,
+                )
+                value.raise_for_status()
+                rows = value.json()
+                return rows if isinstance(rows, list) else []
+            except Exception as exc:
+                failures.append(f"{scheme} {type(exc).__name__}")
+        raise RuntimeError("；".join(failures))
 
     records = cached(f"sina_moneyflow_{code}", 3600, load, refresh)
     if not records:
