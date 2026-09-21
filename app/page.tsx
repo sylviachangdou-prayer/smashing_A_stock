@@ -451,6 +451,32 @@ function Fold({
   );
 }
 
+function BarChart<T extends { date: string }>({
+  rows,
+  pick,
+  label,
+}: {
+  rows: T[];
+  pick: (row: T) => number;
+  label: string;
+}) {
+  const max = Math.max(...rows.map((row) => Math.abs(pick(row))), 1);
+  return (
+    <div className="bar-chart" aria-label={label}>
+      {rows.map((row) => {
+        const value = pick(row);
+        return (
+          <div key={row.date} title={`${row.date} ${formatMoney(value)}`}>
+            <i className={value >= 0 ? "up" : "down"} style={{ height: `${8 + Math.abs(value) / max * 82}px` }} />
+            <small>{row.date.slice(5)}</small>
+          </div>
+        );
+      })}
+      <span className="zero-line" />
+    </div>
+  );
+}
+
 function ItemTitle({ no, children }: { no: number; children: React.ReactNode }) {
   return <h3><i className="item-no">{no}</i>{children}</h3>;
 }
@@ -1817,19 +1843,7 @@ export default function Home() {
                       <b> {formatMoney(flowRows.reduce((sum, row) => sum + Number(row.main_net ?? 0), 0))}</b>，
                       其中净流入 <b>{flowRows.filter((row) => (row.main_net ?? 0) > 0).length}</b> 天、净流出 <b>{flowRows.filter((row) => (row.main_net ?? 0) < 0).length}</b> 天。
                     </Answer>
-                    <div className="bar-chart" aria-label="最近一个月每日资金净流入">
-                      {flowRows.map((row) => {
-                        const value = Number(row.main_net ?? 0);
-                        const max = Math.max(...flowRows.map((item) => Math.abs(Number(item.main_net ?? 0))), 1);
-                        return (
-                          <div key={row.date} title={`${row.date} ${formatMoney(value)}`}>
-                            <i className={value >= 0 ? "up" : "down"} style={{ height: `${8 + Math.abs(value) / max * 82}px` }} />
-                            <small>{row.date.slice(5)}</small>
-                          </div>
-                        );
-                      })}
-                      <span className="zero-line" />
-                    </div>
+                    <BarChart rows={flowRows} pick={(row) => Number(row.main_net ?? 0)} label="最近一个月每日资金净流入" />
                   </article>
                   <article className="panel">
                     <div className="panel-title"><div><h3>逐日资金流明细</h3></div></div>
@@ -2037,19 +2051,7 @@ export default function Home() {
                   <SourceLink sourceId={margin[0]?.source_id} sources={sources} />
                 </div>
                 <Fold label="展开融资余额日变化与逐日明细" hint={`${margin.length} 个交易日`}>
-                <div className="bar-chart" aria-label="最近20个交易日融资余额日变化">
-                  {margin.map((row) => {
-                    const value = Number(row.financing_balance_change ?? 0);
-                    const max = Math.max(...margin.map((item) => Math.abs(Number(item.financing_balance_change ?? 0))), 1);
-                    return (
-                      <div key={row.date} title={`${row.date} ${formatMoney(value)}`}>
-                        <i className={value >= 0 ? "up" : "down"} style={{ height: `${8 + Math.abs(value) / max * 82}px` }} />
-                        <small>{row.date.slice(5)}</small>
-                      </div>
-                    );
-                  })}
-                  <span className="zero-line" />
-                </div>
+                <BarChart rows={margin} pick={(row) => Number(row.financing_balance_change ?? 0)} label="最近20个交易日融资余额日变化" />
                 <div className="table-wrap">
                   <table>
                     <thead><tr><th>交易日</th><th>融资买入</th><th>融资偿还</th><th>融资余额变化</th><th>融资余额</th><th>融券卖出量</th><th>融券余额/余量</th><th>来源</th></tr></thead>

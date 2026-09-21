@@ -560,68 +560,62 @@ def sse_a_share_list() -> list[dict[str, Any]]:
     return rows
 
 
+MasterLoaders = tuple[tuple[Callable[[], list[dict[str, Any]]], str], ...]
+
+
+def _load_master_batches(loaders: MasterLoaders) -> list[tuple[list[dict[str, Any]], str]]:
+    batches: list[tuple[list[dict[str, Any]], str]] = []
+    with ThreadPoolExecutor(max_workers=len(loaders)) as pool:
+        futures = {pool.submit(loader): source_id for loader, source_id in loaders}
+        for future in as_completed(futures):
+            try:
+                rows = future.result()
+            except Exception:
+                continue
+            if rows:
+                batches.append((rows, futures[future]))
+    return batches
+
+
 def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
     with STOCK_MASTER_REFRESH_LOCK:
-        official_loaders = (
-            (sse_a_share_list, "sse-stock-list"),
-            (szse_a_share_list, "szse-stock-list"),
-            (lambda: frame_records(ak.stock_info_bj_name_code()), "bse-stock-list"),
-        )
-        batches: list[tuple[list[dict[str, Any]], str]] = []
-        successful_sources: set[str] = set()
-        with ThreadPoolExecutor(max_workers=len(official_loaders)) as pool:
-            future_sources = {pool.submit(loader): source_id for loader, source_id in official_loaders}
-            for future in as_completed(future_sources):
-                try:
-                    rows = future.result()
-                    if rows:
-                        source_id = future_sources[future]
-                        batches.append((rows, source_id))
-                        successful_sources.add(source_id)
-                except Exception:
-                    continue
-        if not set(MASTER_OFFICIAL_SOURCE.values()) <= successful_sources:
-            secondary_loaders = (
-                (eastmoney_code_list, "eastmoney-stock-list"),
-                (lambda: frame_records(ak.stock_zh_a_spot()), "sina-stock-list"),
+        batches = _load_master_batches(
+            (
+                (sse_a_share_list, "sse-stock-list"),
+                (szse_a_share_list, "szse-stock-list"),
+                (lambda: frame_records(ak.stock_info_bj_name_code()), "bse-stock-list"),
             )
-            with ThreadPoolExecutor(max_workers=len(secondary_loaders)) as pool:
-                future_sources = {pool.submit(loader): source_id for loader, source_id in secondary_loaders}
-                for future in as_completed(future_sources):
-                    try:
-                        rows = future.result()
-                        if rows:
-                            source_id = future_sources[future]
-                            batches.append((rows, source_id))
-                            successful_sources.add(source_id)
-                    except Exception:
-                        continue
-        if not batches:
-            if stale:
-                return stale
-            raise RuntimeError("沪深北官方与备用股票代码表均不可用")
+        )
+        if not set(MASTER_OFFICIAL_SOURCE.values()) <= {source_id for _, source_id in batches}:
+            batches += _load_master_batches(
+                (
+                    (eastmoney_code_list, "eastmoney-stock-list"),
+                    (lambda: frame_records(ak.stock_zh_a_spot()), "sina-stock-list"),
+                )
+            )
 
-        official_sources = successful_sources.intersection(MASTER_OFFICIAL_SOURCE.values())
+        successful = {source_id for _, source_id in batches}
+        official_sources = successful & set(MASTER_OFFICIAL_SOURCE.values())
         merged = merge_stock_master_batches(batches, official_sources, stale)
         if not merged:
             if stale:
                 return stale
-            raise RuntimeError("股票代码表响应为空")
+            raise RuntimeError("沪深北官方与备用股票代码表均不可用")
 
-        meta = {
-            "refreshed_at": now_iso(),
-            "official_sources": sorted(official_sources),
-            "secondary_sources": sorted(
-                successful_sources.intersection({"eastmoney-stock-list", "sina-stock-list"})
-            ),
-            "stale_fallback_exchanges": sorted(
-                exchange
-                for exchange, source_id in MASTER_OFFICIAL_SOURCE.items()
-                if source_id not in official_sources
-            ),
-        }
         _write_json_atomic(cache_file("stock_master"), merged)
-        _write_json_atomic(cache_file("stock_master_meta"), meta)
+        _write_json_atomic(
+            cache_file("stock_master_meta"),
+            {
+                "refreshed_at": now_iso(),
+                "official_sources": sorted(official_sources),
+                "secondary_sources": sorted(successful & {"eastmoney-stock-list", "sina-stock-list"}),
+                "stale_fallback_exchanges": sorted(
+                    exchange
+                    for exchange, source_id in MASTER_OFFICIAL_SOURCE.items()
+                    if source_id not in official_sources
+                ),
+            },
+        )
         return merged
 
 
@@ -2412,6 +2406,17 @@ def report_section(
     return first
 
 
+def filing_source(kind: str, code: str, filing: dict[str, Any]) -> dict[str, Any]:
+    return source(
+        f"filing-{kind}-{code}-{filing['published_at']}",
+        filing["provider"],
+        filing["title"],
+        filing["url"],
+        period=filing["published_at"],
+        published_at=filing["published_at"],
+    )
+
+
 def annual_report_facts(
     code: str, records: list[dict[str, Any]], refresh: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -2419,14 +2424,7 @@ def annual_report_facts(
     if not filing:
         return {}, None
     text = filing_text(f"filing_annual_{code}_{filing['published_at']}", filing["pdf_url"], refresh)
-    src = source(
-        f"cninfo-annual-{code}-{filing['published_at']}",
-        filing["provider"],
-        filing["title"],
-        filing["url"],
-        period=filing["published_at"],
-        published_at=filing["published_at"],
-    )
+    src = filing_source("annual", code, filing)
     facts = {
         "core_competence": report_section(
             text, ("核心竞争力分析",), ("四、主营业务分析", "第四节", "四、公司未来发展")
@@ -2481,14 +2479,7 @@ def competition_disclosure(
     )
     if not section_text:
         return {}, None
-    src = source(
-        f"cninfo-offering-{code}-{filing['published_at']}",
-        filing["provider"],
-        filing["title"],
-        filing["url"],
-        period=filing["published_at"],
-        published_at=filing["published_at"],
-    )
+    src = filing_source("offering", code, filing)
     return (
         {"text": section_text, "document": filing["title"], "published_at": filing["published_at"]},
         src,
