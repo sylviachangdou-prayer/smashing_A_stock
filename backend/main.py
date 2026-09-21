@@ -476,42 +476,52 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 
 
 SSE_STOCK_LIST = "https://query.sse.com.cn/sseQuery/commonQuery.do"
+EASTMONEY_CLIST_HOSTS = ("push2.eastmoney.com", "82.push2.eastmoney.com", "push2delay.eastmoney.com")
+EASTMONEY_CLIST_MARKETS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
 
 
-def sse_a_share_list() -> list[dict[str, Any]]:
-    """上交所主板与科创板股票列表。响应接近两兆，用比全局默认更长的超时。"""
-    rows: list[dict[str, Any]] = []
-    for stock_type in ("1", "8"):
-        payload = requests.get(
-            SSE_STOCK_LIST,
-            params={
-                "STOCK_TYPE": stock_type,
-                "REG_PROVINCE": "",
-                "CSRC_CODE": "",
-                "STOCK_CODE": "",
-                "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L",
-                "COMPANY_STATUS": "2,4,5,7,8",
-                "type": "inParams",
-                "isPagination": "true",
-                "pageHelp.cacheSize": "1",
-                "pageHelp.beginPage": "1",
-                "pageHelp.pageSize": "10000",
-                "pageHelp.pageNo": "1",
-                "pageHelp.endPage": "1",
-            },
-            headers={
-                **BROWSER_HEADERS,
-                "Host": "query.sse.com.cn",
-                "Referer": "https://www.sse.com.cn/assortment/stock/list/share/",
-            },
-            timeout=90,
-        )
-        payload.raise_for_status()
-        for item in (payload.json() or {}).get("result") or []:
-            code = str(item.get("A_STOCK_CODE") or "").strip()
-            if code:
-                rows.append({"证券代码": code, "证券简称": str(item.get("SEC_NAME_CN") or "").strip()})
-    return rows
+def eastmoney_code_page(page: int) -> tuple[list[dict[str, Any]], int]:
+    for host in EASTMONEY_CLIST_HOSTS:
+        try:
+            payload = requests.get(
+                f"https://{host}/api/qt/clist/get",
+                params={
+                    "pn": str(page),
+                    "pz": "100",
+                    "po": "0",
+                    "np": "1",
+                    "fltt": "2",
+                    "invt": "2",
+                    "fid": "f12",
+                    "fs": EASTMONEY_CLIST_MARKETS,
+                    "fields": "f12,f14",
+                },
+                headers={**BROWSER_HEADERS, "Referer": EASTMONEY_QUOTE},
+                timeout=25,
+            )
+            payload.raise_for_status()
+            data = (payload.json() or {}).get("data") or {}
+            return data.get("diff") or [], int(data.get("total") or 0)
+        except Exception:
+            continue
+    raise RuntimeError(f"东方财富代码表第 {page} 页在所有镜像上均不可用")
+
+
+def eastmoney_code_list() -> list[dict[str, Any]]:
+    """沪深北全市场代码表。每页固定一百条，页间并发，任一页取不到就整批作废。"""
+    first, total = eastmoney_code_page(1)
+    pages = range(2, math.ceil(total / 100) + 1)
+    items: dict[int, list[dict[str, Any]]] = {1: first}
+    if pages:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(eastmoney_code_page, page): page for page in pages}
+            for future in as_completed(futures):
+                items[futures[future]] = future.result()[0]
+    return [
+        {"代码": row.get("f12"), "名称": row.get("f14")}
+        for page in sorted(items)
+        for row in items[page]
+    ]
 
 
 def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -536,7 +546,7 @@ def _refresh_stock_master(stale: list[dict[str, str]]) -> list[dict[str, str]]:
                     continue
         if not set(MASTER_OFFICIAL_SOURCE.values()) <= successful_sources:
             secondary_loaders = (
-                (lambda: frame_records(ak.stock_zh_a_spot_em()), "eastmoney-stock-list"),
+                (eastmoney_code_list, "eastmoney-stock-list"),
                 (lambda: frame_records(ak.stock_zh_a_spot()), "sina-stock-list"),
             )
             with ThreadPoolExecutor(max_workers=len(secondary_loaders)) as pool:
