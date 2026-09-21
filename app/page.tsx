@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import { track } from "./analytics";
+import { CandleChart, type CandleBar } from "./candle-chart";
 import { BRAND_MARK } from "./site";
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -321,6 +322,7 @@ type ReportState = {
   company: SearchItem;
   sourceMode: SourceMode;
   quote?: ApiResponse<QuoteData>;
+  candles?: ApiResponse<{ bars: CandleBar[] }>;
   overview?: ApiResponse<OverviewData>;
   capital?: ApiResponse<CapitalData>;
   contracts?: ApiResponse<ContractRow[]>;
@@ -365,6 +367,7 @@ async function searchCompanies(keyword: string, scope: SearchScope, signal?: Abo
 function sourceMap(report?: ReportState) {
   const sources = [
     ...(report?.quote?.sources ?? []),
+    ...(report?.candles?.sources ?? []),
     ...(report?.overview?.sources ?? []),
     ...(report?.capital?.sources ?? []),
     ...(report?.contracts?.sources ?? []),
@@ -658,6 +661,10 @@ export default function Home() {
       `/api/company/${company.code}/quote?${modeParam}${refresh ? "&refresh=true" : ""}`,
       12000,
     ).then((quote) => update({ quote })).catch((error) => update({ quote: failed("实时行情", {} as QuoteData, error) }));
+    const candlesTask = getJson<{ bars: CandleBar[] }>(
+      `/api/company/${company.code}/candles?days=120&${modeParam}${refresh ? "&refresh=true" : ""}`,
+      30000,
+    ).then((candles) => update({ candles })).catch((error) => update({ candles: failed("日线行情", { bars: [] }, error) }));
     const overviewTask = getJson<OverviewData>(
       `/api/company/${company.code}/overview${suffix}`,
       45000,
@@ -703,7 +710,7 @@ export default function Home() {
       30000,
     ).then((exchange) => update({ exchange })).catch((error) => update({ exchange: failed("交易所登记", {}, error) }));
     await Promise.allSettled([
-      quoteTask, overviewTask, capitalTask, contractsTask, peersTask,
+      quoteTask, candlesTask, overviewTask, capitalTask, contractsTask, peersTask,
       businessTask, financialsTask, institutionsTask, moneyflowTask, researchTask, sentimentTask,
       exchangeTask,
     ]);
@@ -786,6 +793,7 @@ export default function Home() {
   }, [reports, selected, sourceMode]);
 
   const quote = active?.quote?.data ?? {};
+  const candleBars = active?.candles?.data.bars ?? [];
   const quoteNumber = (key: keyof QuoteData) => {
     const value = quote[key]?.value;
     return value == null ? undefined : Number(value);
@@ -1097,6 +1105,16 @@ export default function Home() {
                   <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
                 ))}
               </dl>
+            </section>
+          )}
+
+          {candleBars.length > 0 && (
+            <section className="panel chart-panel candle-panel">
+              <div className="panel-title">
+                <div><h3>日线走势</h3></div>
+                <SourceLink sourceId={candleBars[0]?.source_id} sources={sources} />
+              </div>
+              <CandleChart bars={candleBars} />
             </section>
           )}
 

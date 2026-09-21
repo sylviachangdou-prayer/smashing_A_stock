@@ -541,6 +541,25 @@ td, .quote-grid dd, .metric-grid strong { font-variant-numeric: tabular-nums; }
 .negative { color: var(--red) !important; }
 
 .chart-panel { padding-bottom: 8px; }
+.candle-panel { padding-bottom: 16px; }
+.candle-wrap { position: relative; }
+.candle-readout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 18px;
+  min-height: 24px;
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.candle-readout b { font-size: 14px; letter-spacing: .02em; }
+.candle-up { color: #c0392b; }
+.candle-down { color: var(--green); }
+.candle-muted { color: var(--muted); }
+.candle-canvas { width: 100%; }
+.candle-hint { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+.chart-fallback { margin: 0; color: var(--muted); font-size: 14px; }
 .bar-chart {
   height: 230px;
   margin: 12px 20px 4px;

@@ -3089,7 +3089,7 @@ def eastmoney_daily_flow(code: str, market: str) -> list[dict[str, Any]]:
     return rows
 
 
-def eastmoney_chip_bars(code: str, market: str) -> list[dict[str, Any]]:
+def eastmoney_daily_bars(code: str, market: str) -> list[dict[str, Any]]:
     bars: list[dict[str, Any]] = []
     for line in eastmoney_klines(
         "/api/qt/stock/kline/get",
@@ -3114,13 +3114,15 @@ def eastmoney_chip_bars(code: str, market: str) -> list[dict[str, Any]]:
                 "close": float(cells[2]),
                 "high": float(cells[3]),
                 "low": float(cells[4]),
+                "volume": float(cells[5]),
+                "amount": float(cells[6]),
                 "turnover": float(cells[10]),
             }
         )
     return bars
 
 
-def tencent_chip_bars(code: str) -> list[dict[str, Any]]:
+def tencent_daily_bars(code: str) -> list[dict[str, Any]]:
     """腾讯日 K 不下发换手率，按当前流通股本折算，流通股本变动期间会有偏差。"""
     symbol = market_symbol(code, lower=True)
     payload = requests.get(
@@ -3150,6 +3152,8 @@ def tencent_chip_bars(code: str) -> list[dict[str, Any]]:
                 "close": float(row[2]),
                 "high": float(row[3]),
                 "low": float(row[4]),
+                "volume": float(row[5]),
+                "amount": None,
                 "turnover": float(row[5]) * 100 / float_shares * 100,
             }
         )
@@ -3216,13 +3220,16 @@ def chip_distribution(bars: list[dict[str, Any]], tail: int) -> list[dict[str, A
     return rows
 
 
-def chip_cost_records(code: str, market: str) -> list[dict[str, Any]]:
+def daily_bars(code: str, market: str) -> tuple[list[dict[str, Any]], str]:
+    """不复权日 K。筹码推算与 K 线图共用同一份数据，口径一致。"""
     try:
-        bars = eastmoney_chip_bars(code, market)
-        provider = "东方财富"
+        return eastmoney_daily_bars(code, market), "东方财富"
     except Exception:
-        bars = tencent_chip_bars(code)
-        provider = "腾讯财经"
+        return tencent_daily_bars(code), "腾讯财经"
+
+
+def chip_cost_records(code: str, market: str) -> list[dict[str, Any]]:
+    bars, provider = daily_bars(code, market)
     return [{**row, "_provider": provider} for row in chip_distribution(bars, 3)]
 
 
@@ -3263,6 +3270,45 @@ def sina_money_flow(code: str, days: int, source_id: str, refresh: bool = False)
         )
     flow.reverse()
     return flow
+
+
+@app.get("/api/company/{raw_code}/candles")
+def candles(
+    raw_code: str,
+    days: int = Query(120, ge=20, le=210),
+    refresh: bool = False,
+    mode: SourceMode = "official",
+) -> dict[str, Any]:
+    try:
+        code = normalize_code(raw_code)
+        lookup_company(code)
+    except ValueError as exc:
+        return response({}, [], [str(exc)], status="error")
+    if mode == "strict":
+        return response(
+            {"bars": []},
+            [],
+            ["仅官方来源模式不展示商业行情平台的日线数据。"],
+            status="empty",
+        )
+    market = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}[exchange_for(code)]
+    try:
+        bars, provider = cached(f"candles_{code}", 3600, lambda: daily_bars(code, market), refresh)
+    except Exception as exc:
+        return response({"bars": []}, [], [f"日线行情获取失败：{type(exc).__name__}: {exc}"], status="error")
+    source_id = f"candles-{code}"
+    rows = [{**bar, "source_id": source_id} for bar in bars[-days:]]
+    src = source(
+        source_id,
+        provider,
+        f"{code} 日线行情",
+        quote_url(code) if provider == "东方财富" else f"https://gu.qq.com/{market_symbol(code, lower=True)}",
+        tier="secondary",
+    )
+    warnings = ["日线为不复权价格，与筹码成本同源；除权除息日前后的价格不连续。"]
+    if provider != "东方财富":
+        warnings.append("东方财富历史行情不可用，日线改用腾讯证券，未提供成交额。")
+    return response({"bars": rows}, [src], warnings, status=None if rows else "empty")
 
 
 @app.get("/api/company/{raw_code}/moneyflow")
