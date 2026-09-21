@@ -1705,7 +1705,8 @@ def contracts(
         published = parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime")))
         url = str(first_value(row, ("公告链接", "网址", "url")) or CNINFO_HOME)
         source_id = f"cninfo-contract-{code}-{published or index}"
-        src = source(source_id, "巨潮资讯", title, url, published_at=published)
+        provider = str(row.get("_provider") or "巨潮资讯")
+        src = source(source_id, provider, title, url, published_at=published)
         sources.append(src)
         item: dict[str, Any] = {
             "title": title,
@@ -2067,16 +2068,170 @@ def parse_partner_section(section_text: str | None) -> dict[str, Any]:
     return result
 
 
-def disclosure_records(code: str, start: date) -> list[dict[str, Any]]:
-    with CNINFO_QUERY_LOCK:
-        return frame_records(
-            ak.stock_zh_a_disclosure_report_cninfo(
-                symbol=code,
-                market="沪深京",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=date.today().strftime("%Y%m%d"),
-            )
+EASTMONEY_ANN_LIST = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+EASTMONEY_ANN_PAGE = "https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
+EASTMONEY_ANN_PDF = "https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf"
+SZSE_ANN_LIST = "https://www.szse.cn/api/disc/announcement/annList"
+SZSE_ANN_PAGE = "https://www.szse.cn/disclosure/listed/bulletinDetail/index.html?{ann_id}"
+SZSE_ANN_PDF = "https://disc.static.szse.cn/download{path}"
+SSE_ANN_LIST = "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
+
+
+def cninfo_disclosure(code: str, start: date) -> list[dict[str, Any]]:
+    rows = frame_records(
+        ak.stock_zh_a_disclosure_report_cninfo(
+            symbol=code,
+            market="沪深京",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=date.today().strftime("%Y%m%d"),
         )
+    )
+    return [{**row, "_provider": "巨潮资讯"} for row in rows]
+
+
+def eastmoney_disclosure(code: str, start: date) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for page in range(1, 16):
+        payload = requests.get(
+            EASTMONEY_ANN_LIST,
+            params={
+                "page_size": "100",
+                "page_index": str(page),
+                "ann_type": "A",
+                "client_source": "web",
+                "stock_list": code,
+                "f_node": "0",
+                "s_node": "0",
+            },
+            headers={**BROWSER_HEADERS, "Referer": "https://data.eastmoney.com/notices/"},
+            timeout=25,
+        )
+        payload.raise_for_status()
+        items = ((payload.json() or {}).get("data") or {}).get("list") or []
+        if not items:
+            break
+        for item in items:
+            published = str(item.get("notice_date") or "")[:10]
+            art_code = str(item.get("art_code") or "")
+            if not published or not art_code:
+                continue
+            rows.append(
+                {
+                    "公告标题": str(item.get("title") or ""),
+                    "公告时间": published,
+                    "公告链接": EASTMONEY_ANN_PAGE.format(code=code, art_code=art_code),
+                    "pdf_url": EASTMONEY_ANN_PDF.format(art_code=art_code),
+                    "_provider": "东方财富",
+                }
+            )
+        if str(items[-1].get("notice_date") or "")[:10] < start.isoformat():
+            break
+    return rows
+
+
+def szse_disclosure(code: str, start: date) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for channel in ("fixed_disc", "listedNotice_disc"):
+        for page in range(1, 11):
+            payload = requests.post(
+                SZSE_ANN_LIST,
+                json={
+                    "seDate": [start.isoformat(), date.today().isoformat()],
+                    "stock": [code],
+                    "channelCode": [channel],
+                    "pageSize": 50,
+                    "pageNum": page,
+                },
+                headers={
+                    **BROWSER_HEADERS,
+                    "Content-Type": "application/json",
+                    "Referer": "https://www.szse.cn/disclosure/listed/notice/index.html",
+                },
+                timeout=25,
+            )
+            payload.raise_for_status()
+            items = (payload.json() or {}).get("data") or []
+            if not items:
+                break
+            for item in items:
+                attach = str(item.get("attachPath") or "")
+                rows.append(
+                    {
+                        "公告标题": str(item.get("title") or ""),
+                        "公告时间": str(item.get("publishTime") or "")[:10],
+                        "公告链接": SZSE_ANN_PAGE.format(ann_id=item.get("id") or ""),
+                        "pdf_url": SZSE_ANN_PDF.format(path=attach) if attach else "",
+                        "_provider": "深圳证券交易所",
+                    }
+                )
+    return rows
+
+
+def sse_disclosure(code: str, start: date) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for page in range(1, 11):
+        payload = requests.get(
+            SSE_ANN_LIST,
+            params={
+                "jsonCallBack": "jsonpCallback",
+                "isPagination": "true",
+                "productId": code,
+                "keyWord": "",
+                "securityType": "0101",
+                "reportType2": "",
+                "reportType": "ALL",
+                "beginDate": start.isoformat(),
+                "endDate": date.today().isoformat(),
+                "pageHelp.pageSize": "50",
+                "pageHelp.pageNo": str(page),
+                "pageHelp.beginPage": str(page),
+                "pageHelp.cacheSize": "1",
+                "pageHelp.endPage": str(page),
+            },
+            headers={**BROWSER_HEADERS, "Referer": "https://www.sse.com.cn/"},
+            timeout=25,
+        )
+        payload.raise_for_status()
+        wrapper = re.search(r"jsonpCallback\((.*)\)\s*$", payload.text, re.S)
+        grouped = json.loads(wrapper.group(1) if wrapper else payload.text)["pageHelp"]["data"]
+        items = [row for group in grouped for row in (group if isinstance(group, list) else [group])]
+        if not items:
+            break
+        for item in items:
+            path = str(item.get("URL") or "")
+            rows.append(
+                {
+                    "公告标题": str(item.get("TITLE") or ""),
+                    "公告时间": str(item.get("SSEDATE") or "")[:10],
+                    "公告链接": f"https://www.sse.com.cn{path}" if path else CNINFO_HOME,
+                    "_provider": "上海证券交易所",
+                }
+            )
+    return rows
+
+
+def disclosure_records(code: str, start: date) -> list[dict[str, Any]]:
+    """巨潮为证监会指定披露平台，优先使用；被上游拒绝时按交易所与东方财富的公告索引回退。"""
+    chain: list[tuple[str, Callable[[str, date], list[dict[str, Any]]]]] = [
+        ("巨潮资讯", cninfo_disclosure),
+        ("东方财富", eastmoney_disclosure),
+    ]
+    if exchange_for(code) == "SZSE":
+        chain.append(("深圳证券交易所", szse_disclosure))
+    elif exchange_for(code) == "SSE":
+        chain.append(("上海证券交易所", sse_disclosure))
+    with CNINFO_QUERY_LOCK:
+        failures: list[str] = []
+        for name, loader in chain:
+            try:
+                rows = loader(code, start)
+            except Exception as exc:
+                failures.append(f"{name} {type(exc).__name__}")
+                continue
+            if rows:
+                return rows
+            failures.append(f"{name} 无记录")
+        raise RuntimeError("公告索引不可用（" + "；".join(failures) + "）")
 
 
 FILING_INDEX_DAYS = 1830
@@ -2114,15 +2269,20 @@ def latest_filing(
             continue
         detail = str(first_value(row, ("公告链接", "网址", "url")) or "")
         published = parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime")))
-        announcement = re.search(r"announcementId=(\d+)", detail)
-        if not announcement or not published:
+        pdf_url = str(row.get("pdf_url") or "")
+        if not pdf_url and published:
+            announcement = re.search(r"announcementId=(\d+)", detail)
+            if announcement:
+                pdf_url = CNINFO_PDF.format(day=published, announcement_id=announcement.group(1))
+        if not pdf_url or not published:
             continue
         candidates.append(
             {
                 "title": title,
                 "published_at": published,
                 "url": detail,
-                "pdf_url": CNINFO_PDF.format(day=published, announcement_id=announcement.group(1)),
+                "pdf_url": pdf_url,
+                "provider": str(row.get("_provider") or "巨潮资讯"),
             }
         )
     candidates.sort(key=lambda item: item["published_at"], reverse=True)
@@ -2175,7 +2335,7 @@ def annual_report_facts(
     text = filing_text(f"filing_annual_{code}_{filing['published_at']}", filing["pdf_url"], refresh)
     src = source(
         f"cninfo-annual-{code}-{filing['published_at']}",
-        "巨潮资讯",
+        filing["provider"],
         filing["title"],
         filing["url"],
         period=filing["published_at"],
@@ -2208,7 +2368,7 @@ def annual_report_facts(
 def competition_disclosure(
     code: str, records: list[dict[str, Any]], refresh: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    pattern = r"(招股说明书|募集说明书)(（[^）]*）)?$"
+    pattern = r"(招股说明书|募集说明书)([（(][^）)]*[）)])?$"
     exclude = r"摘要|确认意见|法律意见|核查意见|之|公告"
     # 先用已经抓好的近五年索引；只有里面没有发行文件时，才去爬十二年存档。
     filing = latest_filing(records, pattern, exclude)
@@ -2237,7 +2397,7 @@ def competition_disclosure(
         return {}, None
     src = source(
         f"cninfo-offering-{code}-{filing['published_at']}",
-        "巨潮资讯",
+        filing["provider"],
         filing["title"],
         filing["url"],
         period=filing["published_at"],
@@ -2741,6 +2901,207 @@ def institutions(raw_code: str, refresh: bool = False, mode: SourceMode = "offic
 
 EASTMONEY_FLOW_CALIBER = "主力净流入（超大单＋大单，东方财富口径）"
 SINA_FLOW_CALIBER = "全部委托单净流入（新浪财经口径）"
+EASTMONEY_HIS_HOSTS = (
+    "push2his.eastmoney.com",
+    "1.push2his.eastmoney.com",
+    "7.push2his.eastmoney.com",
+    "63.push2his.eastmoney.com",
+)
+EASTMONEY_SECID_MARKET = {"sh": "1", "sz": "0", "bj": "0"}
+CYQ_FACTOR = 150
+CYQ_WINDOW = 210
+TENCENT_KLINE = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+TENCENT_SNAPSHOT = "https://qt.gtimg.cn/q="
+
+
+def eastmoney_klines(path: str, params: dict[str, str]) -> list[str]:
+    """东方财富历史行情接口在部分网络下会被直接断连，按镜像域名依次重试。"""
+    failures: list[str] = []
+    for host in EASTMONEY_HIS_HOSTS:
+        try:
+            payload = requests.get(
+                f"https://{host}{path}",
+                params=params,
+                headers={**BROWSER_HEADERS, "Referer": EASTMONEY_QUOTE},
+                timeout=20,
+            )
+            payload.raise_for_status()
+            klines = ((payload.json() or {}).get("data") or {}).get("klines") or []
+            if klines:
+                return klines
+            failures.append(f"{host} 无数据")
+        except Exception as exc:
+            failures.append(f"{host} {type(exc).__name__}")
+    raise RuntimeError("；".join(failures))
+
+
+def eastmoney_daily_flow(code: str, market: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in eastmoney_klines(
+        "/api/qt/stock/fflow/daykline/get",
+        {
+            "lmt": "0",
+            "klt": "101",
+            "secid": f"{EASTMONEY_SECID_MARKET[market]}.{code}",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+        },
+    ):
+        cells = line.split(",")
+        if len(cells) < 13:
+            continue
+        rows.append(
+            {
+                "日期": cells[0],
+                "主力净流入-净额": number_or_none(cells[1]),
+                "小单净流入-净额": number_or_none(cells[2]),
+                "中单净流入-净额": number_or_none(cells[3]),
+                "大单净流入-净额": number_or_none(cells[4]),
+                "超大单净流入-净额": number_or_none(cells[5]),
+                "主力净流入-净占比": number_or_none(cells[6]),
+                "收盘价": number_or_none(cells[11]),
+                "涨跌幅": number_or_none(cells[12]),
+            }
+        )
+    return rows
+
+
+def eastmoney_chip_bars(code: str, market: str) -> list[dict[str, Any]]:
+    bars: list[dict[str, Any]] = []
+    for line in eastmoney_klines(
+        "/api/qt/stock/kline/get",
+        {
+            "secid": f"{EASTMONEY_SECID_MARKET[market]}.{code}",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": "0",
+            "end": date.today().strftime("%Y%m%d"),
+            "lmt": str(CYQ_WINDOW),
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        },
+    ):
+        cells = line.split(",")
+        if len(cells) < 11:
+            continue
+        bars.append(
+            {
+                "date": cells[0],
+                "open": float(cells[1]),
+                "close": float(cells[2]),
+                "high": float(cells[3]),
+                "low": float(cells[4]),
+                "turnover": float(cells[10]),
+            }
+        )
+    return bars
+
+
+def tencent_chip_bars(code: str) -> list[dict[str, Any]]:
+    """腾讯日 K 不下发换手率，按当前流通股本折算，流通股本变动期间会有偏差。"""
+    symbol = market_symbol(code, lower=True)
+    payload = requests.get(
+        TENCENT_KLINE,
+        params={"param": f"{symbol},day,,,{CYQ_WINDOW},"},
+        headers={**BROWSER_HEADERS, "Referer": "https://gu.qq.com/"},
+        timeout=20,
+    )
+    payload.raise_for_status()
+    series = ((payload.json() or {}).get("data") or {}).get(symbol) or {}
+    snapshot = requests.get(TENCENT_SNAPSHOT + symbol, headers=BROWSER_HEADERS, timeout=15)
+    snapshot.encoding = "gbk"
+    cells = snapshot.text.split("~")
+    price = number_or_none(cells[3]) if len(cells) > 3 else None
+    float_cap = number_or_none(cells[44]) if len(cells) > 44 else None
+    if not price or not float_cap:
+        raise RuntimeError("腾讯行情未返回流通市值，无法折算换手率")
+    float_shares = float_cap * 10**8 / price
+    bars: list[dict[str, Any]] = []
+    for row in (series.get("day") or series.get("qfqday") or [])[-CYQ_WINDOW:]:
+        if len(row) < 6:
+            continue
+        bars.append(
+            {
+                "date": str(row[0]),
+                "open": float(row[1]),
+                "close": float(row[2]),
+                "high": float(row[3]),
+                "low": float(row[4]),
+                "turnover": float(row[5]) * 100 / float_shares * 100,
+            }
+        )
+    return bars
+
+
+def chip_distribution(bars: list[dict[str, Any]], tail: int) -> list[dict[str, Any]]:
+    """东方财富公开的三角形筹码衰减模型，与 akshare 内嵌的 CYQCalculator 同算法。"""
+    rows: list[dict[str, Any]] = []
+    for index in range(max(0, len(bars) - tail), len(bars)):
+        window = bars[: index + 1]
+        floor_price = min(bar["low"] for bar in window)
+        ceil_price = max(bar["high"] for bar in window)
+        step = max(0.01, (ceil_price - floor_price) / (CYQ_FACTOR - 1))
+        chips = [0.0] * CYQ_FACTOR
+
+        def slot_of(price: float) -> int:
+            return min(CYQ_FACTOR - 1, max(0, math.floor((price - floor_price) / step)))
+
+        for bar in window:
+            avg = (bar["open"] + bar["close"] + bar["high"] + bar["low"]) / 4
+            rate = min(1.0, max(0.0, bar["turnover"]) / 100)
+            peak = CYQ_FACTOR - 1 if bar["high"] == bar["low"] else 2 / (bar["high"] - bar["low"])
+            chips = [value * (1 - rate) for value in chips]
+            if bar["high"] == bar["low"]:
+                chips[slot_of(avg)] += peak * rate / 2
+                continue
+            low_slot = max(0, math.ceil((bar["low"] - floor_price) / step))
+            for slot in range(low_slot, slot_of(bar["high"]) + 1):
+                price = floor_price + step * slot
+                span = avg - bar["low"] if price <= avg else bar["high"] - avg
+                if abs(span) < 1e-8:
+                    ratio = 1.0
+                elif price <= avg:
+                    ratio = (price - bar["low"]) / span
+                else:
+                    ratio = (bar["high"] - price) / span
+                chips[slot] += ratio * peak * rate
+
+        total = sum(chips)
+
+        def cost_at(share: float) -> float:
+            carried = 0.0
+            for slot, value in enumerate(chips):
+                if carried + value > share:
+                    return floor_price + slot * step
+                carried += value
+            return 0.0
+
+        close = bars[index]["close"]
+        below = sum(value for slot, value in enumerate(chips) if close >= floor_price + slot * step)
+        low_90 = cost_at(total * 0.05)
+        high_90 = cost_at(total * 0.95)
+        rows.append(
+            {
+                "日期": bars[index]["date"],
+                "获利比例": (below / total) if total else 0.0,
+                "平均成本": round(cost_at(total * 0.5), 2),
+                "90成本-低": round(low_90, 2),
+                "90成本-高": round(high_90, 2),
+                "90集中度": ((high_90 - low_90) / (low_90 + high_90)) if (low_90 + high_90) else 0.0,
+            }
+        )
+    return rows
+
+
+def chip_cost_records(code: str, market: str) -> list[dict[str, Any]]:
+    try:
+        bars = eastmoney_chip_bars(code, market)
+        provider = "东方财富"
+    except Exception:
+        bars = tencent_chip_bars(code)
+        provider = "腾讯财经"
+    return [{**row, "_provider": provider} for row in chip_distribution(bars, 3)]
 
 
 def sina_money_flow(code: str, days: int, source_id: str, refresh: bool = False) -> list[dict[str, Any]]:
@@ -2806,10 +3167,10 @@ def moneyflow(
     chip_id = f"eastmoney-chip-{code}"
 
     def load_flow() -> list[dict[str, Any]]:
-        return frame_records(ak.stock_individual_fund_flow(stock=code, market=market))
+        return eastmoney_daily_flow(code, market)
 
     def load_chips() -> list[dict[str, Any]]:
-        return frame_records(ak.stock_cyq_em(symbol=code))
+        return chip_cost_records(code, market)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         flow_future = pool.submit(cached, f"moneyflow_{code}", 3600, load_flow, refresh)
@@ -2876,15 +3237,20 @@ def moneyflow(
                     }
                 )
             if chips:
+                provider = str((chip_future.result() or [{}])[0].get("_provider") or "东方财富")
                 sources.append(
                     source(
                         chip_id,
-                        "东方财富",
+                        provider,
                         f"{code} 筹码分布",
-                        quote_url(code),
+                        quote_url(code) if provider == "东方财富" else f"https://gu.qq.com/{market_symbol(code, lower=True)}",
                         tier="secondary",
                     )
                 )
+                if provider != "东方财富":
+                    warnings.append(
+                        "东方财富历史行情不可用，筹码成本改用腾讯财经日 K 按同一模型推算；换手率按当前流通股本折算，流通股本变动期间与东方财富口径会有偏差。"
+                    )
             else:
                 warnings.append("未取得该证券的筹码分布数据。")
         except Exception as exc:
@@ -3039,7 +3405,8 @@ def sentiment(
             published = parse_date(first_value(row, ("公告时间", "公告日期", "announcementTime")))
             url = str(first_value(row, ("公告链接", "网址", "url")) or CNINFO_HOME)
             source_id = f"cninfo-negative-{code}-{published or index}-{index}"
-            sources.append(source(source_id, "巨潮资讯", title, url, published_at=published))
+            provider = str(row.get("_provider") or "巨潮资讯")
+            sources.append(source(source_id, provider, title, url, published_at=published))
             announcements.append(
                 {
                     "published_at": published,
