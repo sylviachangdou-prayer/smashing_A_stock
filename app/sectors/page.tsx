@@ -142,11 +142,11 @@ export default function SectorsPage() {
   const [sectorOverview, setSectorOverview] = useState<ApiResponse<SectorOverviewData> | null>(null);
   const [sectorMembers, setSectorMembers] = useState<ApiResponse<SectorMembersData> | null>(null);
   const [marketBrief, setMarketBrief] = useState<ApiResponse<MarketBriefData> | null>(null);
-  const [headlineLoading, setHeadlineLoading] = useState(false);
+  const [headlineLoading, setHeadlineLoading] = useState(true);
   const [rankingMetrics, setRankingMetrics] = useState<RankingMetric[]>(["change_percent"]);
 
-  async function loadHeadlines(refresh = false) {
-    setHeadlineLoading(true);
+  // 取数本身不碰加载标志的置位，这样挂载时调用它不会同步触发一次额外渲染。
+  async function fetchHeadlines(refresh = false) {
     try {
       const response = await fetch(`${API_BASE}/api/market-brief${refresh ? "?refresh=true" : ""}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -164,9 +164,19 @@ export default function SectorsPage() {
     }
   }
 
+  // 用户主动刷新时才需要把界面切回加载中。
+  async function loadHeadlines(refresh = false) {
+    setHeadlineLoading(true);
+    await fetchHeadlines(refresh);
+  }
+
   useEffect(() => {
-    void loadHeadlines();
-    const timer = window.setInterval(() => void loadHeadlines(), 6 * 60 * 60 * 1000);
+    // 初始状态就是加载中，这里不再同步置位，避免挂载时多渲染一轮。
+    const timer = window.setInterval(() => void fetchHeadlines(), 6 * 60 * 60 * 1000);
+    // fetchHeadlines 里的 setState 全在 await 之后，不会造成级联渲染；
+    // 这条规则不区分 await 边界，只要 effect 调到含 setState 的函数就报。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void fetchHeadlines();
     return () => window.clearInterval(timer);
   }, []);
 
@@ -293,7 +303,6 @@ export default function SectorsPage() {
         </div>
         <div className="section-heading sector-page-heading">
           <div><h2>最新动向</h2></div>
-          <p>展示新浪财经或东方财富的行业与概念板块最新行情；便捷筛选只按板块名称关键词归类。</p>
         </div>
         <div className="sector-controls">
           <div className="sector-tabs" aria-label="板块类型">

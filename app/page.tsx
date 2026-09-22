@@ -588,10 +588,14 @@ export default function Home() {
     window.localStorage.setItem(HISTORY_LIMIT_STORAGE_KEY, String(historyLimit));
   }, [history, historyLimit, historyReady]);
 
+  // 会话恢复只能放在 effect 里。改成 useState 惰性初始化虽然能满足这条规则，
+  // 但静态导出的 HTML 是构建时生成的、不含任何报告，客户端首帧一旦带上恢复的
+  // 报告就与之不一致，实测会抛 React #418 hydration 失败。
   useEffect(() => {
     try {
       const saved = JSON.parse(window.sessionStorage.getItem(REPORT_SESSION_STORAGE_KEY) ?? "null");
       if (saved?.reports && saved?.selected && saved?.activeCode) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setReports(saved.reports);
         setSelected(saved.selected);
         setActiveCode(saved.activeCode);

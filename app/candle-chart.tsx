@@ -162,7 +162,7 @@ export function CandleChart({ bars, height = 340 }: { bars: CandleBar[]; height?
         </div>
       )}
       <div ref={holder} className="candle-canvas" />
-      <p className="candle-hint">滚轮缩放，拖动平移，双击还原。红涨绿跌，成交量在下方。</p>
+      <p className="candle-hint">滚轮缩放，拖动平移，双击还原。</p>
     </div>
   );
 }
